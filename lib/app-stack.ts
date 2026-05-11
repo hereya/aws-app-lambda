@@ -584,43 +584,28 @@ export class AppStack extends cdk.Stack {
       cdk.Fn.split('/', httpApi.apiEndpoint),
     );
 
-    // `Authorization` cannot be set on an OriginRequestPolicy
-    // (CloudFront caches per cache-key, and Authorization controls the cache
-    // key — it must be forwarded via the CachePolicy instead). `Content-Type`
-    // is part of the request body, also handled by the CachePolicy. Cookies
-    // ride along on the origin-request policy.
-    const apiOriginRequestPolicy = new cloudfront.OriginRequestPolicy(
-      this,
-      'ApiOriginRequestPolicy',
-      {
-        cookieBehavior:
-          cloudfront.OriginRequestCookieBehavior.allowList('hereya_sid'),
-        headerBehavior: cloudfront.OriginRequestHeaderBehavior.none(),
-        queryStringBehavior: cloudfront.OriginRequestQueryStringBehavior.all(),
-      },
-    );
-
-    // Custom cache policy with caching effectively disabled (ttl=0) but with
-    // Authorization + Content-Type forwarded as part of the cache key. The
-    // policy must opt out of cookies/query-strings here so the origin-request
-    // policy alone controls those.
-    const apiCachePolicy = new cloudfront.CachePolicy(
-      this,
-      'ApiCachePolicy',
-      {
-        defaultTtl: cdk.Duration.seconds(0),
-        minTtl: cdk.Duration.seconds(0),
-        maxTtl: cdk.Duration.seconds(0),
-        headerBehavior: cloudfront.CacheHeaderBehavior.allowList(
-          'Authorization',
-          'Content-Type',
-        ),
-        cookieBehavior: cloudfront.CacheCookieBehavior.none(),
-        queryStringBehavior: cloudfront.CacheQueryStringBehavior.none(),
-        enableAcceptEncodingGzip: true,
-        enableAcceptEncodingBrotli: true,
-      },
-    );
+    // /api/* policies.
+    //
+    // Cache: we don't cache API responses, so use the AWS-managed
+    // CACHING_DISABLED policy. CloudFront recently tightened validation
+    // and now rejects CachePolicy specifying headerBehavior/cookieBehavior/
+    // queryStringBehavior together with all-zero TTLs:
+    //   "The parameter HeaderBehavior is invalid for policy with caching
+    //    disabled."
+    // Hence we move all forwarding decisions into the OriginRequestPolicy
+    // below; with caching disabled there's no cache-key concern.
+    //
+    // OriginRequest: forward everything from the viewer except the Host
+    // header (CloudFront sets that to the API Gateway origin domain).
+    // That includes Authorization, Content-Type, custom headers, all
+    // cookies, all query strings. Authorization is allowed here when
+    // forwarded via "all viewer" — it's only forbidden in an explicit
+    // `allowList()` of an OriginRequestPolicy. The managed
+    // ALL_VIEWER_EXCEPT_HOST_HEADER policy is the canonical choice for
+    // API origins behind CloudFront.
+    const apiOriginRequestPolicy =
+      cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER;
+    const apiCachePolicy = cloudfront.CachePolicy.CACHING_DISABLED;
 
     const distributionProps: cloudfront.DistributionProps = {
       defaultRootObject: 'index.html',
