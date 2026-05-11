@@ -13,6 +13,7 @@ import { BucketDeployment, Source } from 'aws-cdk-lib/aws-s3-deployment';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import * as cr from 'aws-cdk-lib/custom-resources';
 import * as crypto from 'crypto';
+import * as fs from 'fs';
 import { Construct } from 'constructs';
 import * as path from 'path';
 
@@ -47,6 +48,20 @@ export class AppStack extends cdk.Stack {
       : 30;
     const nodeRuntime = resolveNodeRuntime(process.env['nodeRuntime']);
     const isSpa = process.env['isSpa'] === 'true';
+
+    // Migration support — when truthy (default), create a sibling Lambda that
+    // runs Drizzle migrations and gate the app Lambda on it via a CFn Custom
+    // Resource. Set `runMigrations=false` to opt out (e.g. backend without a DB).
+    const runMigrationsEnabled =
+      (process.env['runMigrations'] ?? 'true') !== 'false';
+    const migrationHandler =
+      process.env['migrationHandler'] ?? 'migrate.handler';
+    const migrationTimeoutSec = process.env['migrationTimeoutSec']
+      ? parseInt(process.env['migrationTimeoutSec'])
+      : 300; // 5 min — accommodates Aurora resume + multi-statement migrations
+    const migrationMemoryMb = process.env['migrationMemoryMb']
+      ? parseInt(process.env['migrationMemoryMb'])
+      : 512;
 
     // -----------------------------------------------------------------------
     // 2. Parse hereyaProjectEnv and split into policy / secret / plain
@@ -103,30 +118,92 @@ export class AppStack extends cdk.Stack {
 
     // -----------------------------------------------------------------------
     // 4. Lambda function (pre-bundled — fromAsset, not NodejsFunction)
+    //
+    // The same code asset (apps/backend/dist) is reused by the migration
+    // Lambda below — esbuild produces both `handler.js` and `migrate.js` in
+    // the same bundle.
     // -----------------------------------------------------------------------
+
+    const backendCode = lambda.Code.fromAsset(
+      path.join(hereyaProjectRootDir, backendDistFolder),
+    );
+
+    // Helper that wires plainEnv + consolidatedSecret + policyEnv onto a Lambda.
+    // Used for both the app handler and the migration handler so they have
+    // identical credentials/env shape.
+    const configureFunction = (lambdaFn: lambda.Function): void => {
+      if (consolidatedSecret) {
+        lambdaFn.addEnvironment(
+          'HEREYA_SECRETS_ARN',
+          consolidatedSecret.secretArn,
+        );
+        consolidatedSecret.grantRead(lambdaFn);
+      }
+      for (const [, value] of Object.entries(policyEnv)) {
+        const policy = JSON.parse(value as string);
+        for (const statement of policy.Statement) {
+          lambdaFn.addToRolePolicy(iam.PolicyStatement.fromJson(statement));
+        }
+      }
+    };
 
     const fn = new lambda.Function(this, 'Handler', {
       runtime: nodeRuntime,
       handler: lambdaHandler,
-      code: lambda.Code.fromAsset(
-        path.join(hereyaProjectRootDir, backendDistFolder),
-      ),
+      code: backendCode,
       memorySize: lambdaMemoryMb,
       timeout: cdk.Duration.seconds(lambdaTimeoutSec),
       environment: plainEnv,
     });
+    configureFunction(fn);
 
-    if (consolidatedSecret) {
-      fn.addEnvironment('HEREYA_SECRETS_ARN', consolidatedSecret.secretArn);
-      consolidatedSecret.grantRead(fn);
-    }
+    // -----------------------------------------------------------------------
+    // 4a. Migration Lambda + Custom Resource (option B: deploy-time migrations)
+    //
+    // The migration Lambda imports the same backend bundle. A CloudFormation
+    // Custom Resource invokes it on every Create/Update — but only when the
+    // contents of the `drizzle/` migration folder change (we hash the folder
+    // at synth time and pass the hash as a CR property, so CFn re-fires the
+    // CR only when migrations have actually been added/edited).
+    //
+    // The app Lambda has an explicit dependency on the migration CR, so the
+    // stack will not switch traffic to a new app version until migrations
+    // have completed successfully. Failed migrations roll the deploy back.
+    // -----------------------------------------------------------------------
 
-    // Attach IAM policies discovered in hereyaProjectEnv
-    for (const [, value] of Object.entries(policyEnv)) {
-      const policy = JSON.parse(value as string);
-      for (const statement of policy.Statement) {
-        fn.addToRolePolicy(iam.PolicyStatement.fromJson(statement));
-      }
+    let migrationResource: cdk.CustomResource | undefined;
+    if (runMigrationsEnabled) {
+      const migrationFn = new lambda.Function(this, 'MigrationHandler', {
+        runtime: nodeRuntime,
+        handler: migrationHandler,
+        code: backendCode,
+        memorySize: migrationMemoryMb,
+        timeout: cdk.Duration.seconds(migrationTimeoutSec),
+        environment: plainEnv,
+      });
+      configureFunction(migrationFn);
+
+      const migrationProvider = new cr.Provider(this, 'MigrationProvider', {
+        onEventHandler: migrationFn,
+      });
+
+      const migrationHash = hashMigrationFolder(
+        path.join(hereyaProjectRootDir, backendDistFolder, 'drizzle'),
+      );
+
+      migrationResource = new cdk.CustomResource(this, 'MigrationResource', {
+        serviceToken: migrationProvider.serviceToken,
+        resourceType: 'Custom::HereyaAppMigrations',
+        properties: {
+          // Re-runs the CR only when the migration files change. Drizzle's
+          // migrator is idempotent so this is safe either way; this just
+          // avoids no-op CR invocations on every deploy.
+          migrationHash,
+        },
+      });
+
+      // App Lambda must not see traffic until migrations complete.
+      fn.node.addDependency(migrationResource);
     }
 
     // -----------------------------------------------------------------------
@@ -634,6 +711,27 @@ export class AppStack extends cdk.Stack {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// Hashes the contents of the drizzle migrations folder (filenames + content)
+// at synth time. The result is fed into the migration Custom Resource so CFn
+// re-invokes the CR only when actual migration files change. If the folder is
+// missing or empty (very first build before any `db:generate`), we return a
+// stable sentinel — the CR still fires once on initial Create, then no-ops
+// until migrations exist.
+function hashMigrationFolder(folder: string): string {
+  if (!fs.existsSync(folder)) return 'no-migrations';
+  const entries = fs
+    .readdirSync(folder)
+    .filter((f) => f.endsWith('.sql'))
+    .sort();
+  if (entries.length === 0) return 'no-migrations';
+  const h = crypto.createHash('sha256');
+  for (const name of entries) {
+    h.update(name);
+    h.update(fs.readFileSync(path.join(folder, name)));
+  }
+  return h.digest('hex').slice(0, 16);
+}
 
 function resolveNodeRuntime(input: string | undefined): lambda.Runtime {
   if (!input) return lambda.Runtime.NODEJS_22_X;
