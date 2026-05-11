@@ -1,0 +1,7 @@
+name: hereya/aws-app-lambda
+version: 0.1.0
+description: API Gateway + Lambda + CloudFront-fronted Astro frontend, single distribution with /api/* APIGW behavior. Non-blocking ACM cert via custom resource; aliases attached on second deploy after cert validates.
+iac: cdk
+infra: aws
+deploy: true
+visibility: public
