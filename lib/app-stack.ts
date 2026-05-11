@@ -8,6 +8,8 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
+import * as route53 from 'aws-cdk-lib/aws-route53';
+import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import { BucketDeployment, Source } from 'aws-cdk-lib/aws-s3-deployment';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
@@ -30,9 +32,49 @@ export class AppStack extends cdk.Stack {
       throw new Error('hereyaProjectRootDir environment variable is required');
     }
 
-    const domain = process.env['domain'];
-    if (!domain) {
-      throw new Error('domain environment variable is required');
+    // -----------------------------------------------------------------------
+    // Domain resolution.
+    //
+    // Two modes:
+    //   A. External DNS. `domain` is pinned by the user (or by another
+    //      package). The stack runs the legacy 3-custom-resource cert flow
+    //      and emits DNS records for the user to add manually.
+    //   B. Auto-Route53. `defaultRootDomain` (e.g. "example.com") points at
+    //      a Route 53 hosted zone owned by the workspace. The effective
+    //      domain is either `effectiveDomain` (already computed by a
+    //      sibling package like hereya/postmark-app-server), or
+    //      `${subdomainName}.${defaultRootDomain}`, or — as a last resort
+    //      — `${stackName.toLowerCase()}.${defaultRootDomain}`. The stack
+    //      creates an ACM cert with Route 53 DNS validation (one deploy,
+    //      no manual records) and ALIAS A/AAAA records for apex+www that
+    //      point at the CloudFront distribution.
+    // -----------------------------------------------------------------------
+
+    const explicitDomain = process.env['domain'];
+    const defaultRootDomain = process.env['defaultRootDomain'];
+    const subdomainName = process.env['subdomainName'];
+    const effectiveDomainFromEnv = process.env['effectiveDomain'];
+
+    let domain: string;
+    let manageDnsInRoute53 = false;
+    if (explicitDomain) {
+      domain = explicitDomain;
+    } else if (effectiveDomainFromEnv) {
+      domain = effectiveDomainFromEnv;
+      manageDnsInRoute53 = !!defaultRootDomain;
+    } else if (subdomainName && defaultRootDomain) {
+      domain = `${subdomainName}.${defaultRootDomain}`;
+      manageDnsInRoute53 = true;
+    } else if (defaultRootDomain) {
+      // No subdomain pinned. Fall back to stackName as a stable per-stack label.
+      domain = `${this.stackName.toLowerCase()}.${defaultRootDomain}`;
+      manageDnsInRoute53 = true;
+    } else {
+      throw new Error(
+        'Set either `domain` (external DNS) OR `defaultRootDomain` ' +
+          '(Route 53 auto-mode, optionally with `subdomainName` or an ' +
+          'upstream package emitting `effectiveDomain`).',
+      );
     }
 
     const backendDistFolder =
@@ -255,203 +297,250 @@ export class AppStack extends cdk.Stack {
     });
 
     // -----------------------------------------------------------------------
-    // 6. ACM cert via cr.AwsCustomResource (us-east-1, non-blocking)
+    // 6. ACM cert
     //
-    // Three chained custom resources:
+    // Route 53 mode: DnsValidatedCertificate creates the cert in us-east-1
+    // and validates it via Route 53 in the looked-up hosted zone. One
+    // deploy. Aliases are attached immediately.
+    //
+    // External mode: legacy non-blocking flow with three chained
+    // custom resources:
     //   a. RequestCertificate (idempotent via IdempotencyToken = hash(stackName))
     //   b. DescribeCertificate (capture Status + DomainValidationOptions)
     //   c. PutParameter (write /hereya/<stackName>/certStatus for next synth)
+    // Three deploys: first creates the cert + emits DNS records, user adds
+    // them, second captures ISSUED, third flips aliases on.
     // -----------------------------------------------------------------------
 
-    const idempotencyToken = crypto
-      .createHash('sha256')
-      .update(`${this.stackName}-cert-v1`)
-      .digest('hex')
-      .slice(0, 32);
+    // Branch state — populated by whichever path runs below.
+    let certificateForDistribution: acm.ICertificate | undefined;
+    let aliasesEnabledForDistribution = false;
+    let certificateArnForOutput = '';
+    let certificateStatusForOutput = '';
+    let hostedZoneForAliases: route53.IHostedZone | undefined;
 
-    const certPolicy = cr.AwsCustomResourcePolicy.fromStatements([
-      new iam.PolicyStatement({
-        actions: [
-          'acm:RequestCertificate',
-          'acm:DescribeCertificate',
-          'acm:ListCertificates',
-          'ssm:PutParameter',
-        ],
-        resources: ['*'],
-      }),
-    ]);
+    // Validation-record outputs (only populated in external mode).
+    let apexValidationName = '';
+    let apexValidationType = '';
+    let apexValidationValue = '';
+    let wwwValidationName = '';
+    let wwwValidationType = '';
+    let wwwValidationValue = '';
 
-    const requestCertCr = new cr.AwsCustomResource(this, 'RequestCertCr', {
-      resourceType: 'Custom::HereyaRequestCertificate',
-      onCreate: {
-        service: 'ACM',
-        action: 'requestCertificate',
+    if (manageDnsInRoute53) {
+      // ------------------- Route 53 auto-mode -------------------
+      hostedZoneForAliases = route53.HostedZone.fromLookup(this, 'HostedZone', {
+        domainName: defaultRootDomain!,
+      });
+
+      // DnsValidatedCertificate is deprecated but functional — it's the
+      // only single-stack way to create a cross-region (us-east-1) ACM
+      // cert with Route 53 validation. The modern alternative (separate
+      // us-east-1 stack + crossRegionReferences) is significantly more
+      // complex. Revisit when DnsValidatedCertificate is fully removed
+      // from aws-cdk-lib.
+      const cert = new acm.DnsValidatedCertificate(this, 'Cert', {
+        domainName: domain,
+        subjectAlternativeNames: [`www.${domain}`],
+        hostedZone: hostedZoneForAliases,
         region: 'us-east-1',
-        parameters: {
-          DomainName: domain,
-          SubjectAlternativeNames: [`www.${domain}`],
-          ValidationMethod: 'DNS',
-          IdempotencyToken: idempotencyToken,
-        },
-        physicalResourceId: cr.PhysicalResourceId.fromResponse(
-          'CertificateArn',
-        ),
-      },
-      onUpdate: {
-        service: 'ACM',
-        action: 'requestCertificate',
-        region: 'us-east-1',
-        parameters: {
-          DomainName: domain,
-          SubjectAlternativeNames: [`www.${domain}`],
-          ValidationMethod: 'DNS',
-          IdempotencyToken: idempotencyToken,
-        },
-        physicalResourceId: cr.PhysicalResourceId.fromResponse(
-          'CertificateArn',
-        ),
-      },
-      policy: certPolicy,
-      installLatestAwsSdk: false,
-    });
+        validation: acm.CertificateValidation.fromDns(hostedZoneForAliases),
+      });
+      certificateForDistribution = cert;
+      certificateArnForOutput = cert.certificateArn;
+      certificateStatusForOutput = 'ISSUED'; // synchronously waited for by the construct
+      aliasesEnabledForDistribution = true;
+    } else {
+      // ------------------- External DNS mode (legacy 3-CR flow) -------------------
+      //
+      // First synth: SSM parameter does not exist → valueFromLookup returns
+      // 'PENDING_VALIDATION'. aliasesEnabled is false → distribution comes
+      // up without aliases. The user adds the emitted DNS records. After the
+      // next deploy describes the cert as ISSUED, the SSM write captures it
+      // and the THIRD deploy flips aliases on.
 
-    const certificateArn = requestCertCr.getResponseField('CertificateArn');
+      const idempotencyToken = crypto
+        .createHash('sha256')
+        .update(`${this.stackName}-cert-v1`)
+        .digest('hex')
+        .slice(0, 32);
 
-    // Describe the cert — captures Status + DomainValidationOptions
-    const describeCertCr = new cr.AwsCustomResource(this, 'DescribeCertCr', {
-      resourceType: 'Custom::HereyaDescribeCertificate',
-      onCreate: {
-        service: 'ACM',
-        action: 'describeCertificate',
-        region: 'us-east-1',
-        parameters: { CertificateArn: certificateArn },
-        physicalResourceId: cr.PhysicalResourceId.of(
-          `${this.stackName}-cert-describe`,
-        ),
-      },
-      onUpdate: {
-        service: 'ACM',
-        action: 'describeCertificate',
-        region: 'us-east-1',
-        parameters: { CertificateArn: certificateArn },
-        physicalResourceId: cr.PhysicalResourceId.of(
-          `${this.stackName}-cert-describe`,
-        ),
-      },
-      policy: certPolicy,
-      installLatestAwsSdk: false,
-    });
-    describeCertCr.node.addDependency(requestCertCr);
+      const certPolicy = cr.AwsCustomResourcePolicy.fromStatements([
+        new iam.PolicyStatement({
+          actions: [
+            'acm:RequestCertificate',
+            'acm:DescribeCertificate',
+            'acm:ListCertificates',
+            'ssm:PutParameter',
+          ],
+          resources: ['*'],
+        }),
+      ]);
 
-    const certificateStatus = describeCertCr.getResponseField(
-      'Certificate.Status',
-    );
-
-    // Read the validation records — apex + www → two records typically.
-    // CDK's getResponseField returns a token; we collect them as best we can:
-    // ACM returns DomainValidationOptions as an array. Each entry has
-    // ResourceRecord.{Name,Type,Value}. We expose each field as its own output.
-    const apexValidationName = describeCertCr.getResponseField(
-      'Certificate.DomainValidationOptions.0.ResourceRecord.Name',
-    );
-    const apexValidationType = describeCertCr.getResponseField(
-      'Certificate.DomainValidationOptions.0.ResourceRecord.Type',
-    );
-    const apexValidationValue = describeCertCr.getResponseField(
-      'Certificate.DomainValidationOptions.0.ResourceRecord.Value',
-    );
-    const wwwValidationName = describeCertCr.getResponseField(
-      'Certificate.DomainValidationOptions.1.ResourceRecord.Name',
-    );
-    const wwwValidationType = describeCertCr.getResponseField(
-      'Certificate.DomainValidationOptions.1.ResourceRecord.Type',
-    );
-    const wwwValidationValue = describeCertCr.getResponseField(
-      'Certificate.DomainValidationOptions.1.ResourceRecord.Value',
-    );
-
-    // Write the status to SSM so the next synth's valueFromLookup picks it up.
-    const certStatusParamName = `/hereya/${this.stackName}/certStatus`;
-    const putCertStatusCr = new cr.AwsCustomResource(
-      this,
-      'PutCertStatusCr',
-      {
-        resourceType: 'Custom::HereyaPutCertStatus',
+      const requestCertCr = new cr.AwsCustomResource(this, 'RequestCertCr', {
+        resourceType: 'Custom::HereyaRequestCertificate',
         onCreate: {
-          service: 'SSM',
-          action: 'putParameter',
+          service: 'ACM',
+          action: 'requestCertificate',
+          region: 'us-east-1',
           parameters: {
-            Name: certStatusParamName,
-            Value: certificateStatus,
-            Type: 'String',
-            Overwrite: true,
+            DomainName: domain,
+            SubjectAlternativeNames: [`www.${domain}`],
+            ValidationMethod: 'DNS',
+            IdempotencyToken: idempotencyToken,
           },
-          physicalResourceId: cr.PhysicalResourceId.of(
-            `${this.stackName}-cert-status`,
+          physicalResourceId: cr.PhysicalResourceId.fromResponse(
+            'CertificateArn',
           ),
         },
         onUpdate: {
-          service: 'SSM',
-          action: 'putParameter',
+          service: 'ACM',
+          action: 'requestCertificate',
+          region: 'us-east-1',
           parameters: {
-            Name: certStatusParamName,
-            Value: certificateStatus,
-            Type: 'String',
-            Overwrite: true,
+            DomainName: domain,
+            SubjectAlternativeNames: [`www.${domain}`],
+            ValidationMethod: 'DNS',
+            IdempotencyToken: idempotencyToken,
           },
-          physicalResourceId: cr.PhysicalResourceId.of(
-            `${this.stackName}-cert-status`,
+          physicalResourceId: cr.PhysicalResourceId.fromResponse(
+            'CertificateArn',
           ),
         },
-        onDelete: {
-          service: 'SSM',
-          action: 'deleteParameter',
-          parameters: { Name: certStatusParamName },
-          ignoreErrorCodesMatching: 'ParameterNotFound',
-        },
-        policy: cr.AwsCustomResourcePolicy.fromStatements([
-          new iam.PolicyStatement({
-            actions: [
-              'ssm:PutParameter',
-              'ssm:DeleteParameter',
-              'ssm:GetParameter',
-            ],
-            // SSM PutParameter region defaults to the stack region — the
-            // valueFromLookup in step 7 reads from the same region.
-            resources: ['*'],
-          }),
-        ]),
+        policy: certPolicy,
         installLatestAwsSdk: false,
-      },
-    );
-    putCertStatusCr.node.addDependency(describeCertCr);
+      });
 
-    // -----------------------------------------------------------------------
-    // 7. Conditional alias attachment via SSM lookup (synth-time)
-    //
-    // First synth: SSM parameter does not exist → valueFromLookup returns a
-    // dummy placeholder string. aliasesEnabled is false → distribution comes
-    // up without aliases. After the first deploy writes the parameter, the
-    // next synth reads the real value; once ACM marks the cert ISSUED, the
-    // next deploy flips aliases on.
-    // -----------------------------------------------------------------------
+      const certificateArn = requestCertCr.getResponseField('CertificateArn');
+      certificateArnForOutput = certificateArn;
 
-    // The third argument is a default value used when the SSM parameter is
-    // missing (first deploy, before the cert custom resource has written it).
-    // The value resolves to the literal `defaultValue` placeholder until the
-    // real parameter exists. Lookup failures (e.g. no AWS creds during a
-    // dry-run synth) are swallowed so synth never fails on first run.
-    let certStatusFromSsm = 'PENDING_VALIDATION';
-    try {
-      certStatusFromSsm = ssm.StringParameter.valueFromLookup(
-        this,
-        certStatusParamName,
-        'PENDING_VALIDATION',
+      // Describe the cert — captures Status + DomainValidationOptions
+      const describeCertCr = new cr.AwsCustomResource(this, 'DescribeCertCr', {
+        resourceType: 'Custom::HereyaDescribeCertificate',
+        onCreate: {
+          service: 'ACM',
+          action: 'describeCertificate',
+          region: 'us-east-1',
+          parameters: { CertificateArn: certificateArn },
+          physicalResourceId: cr.PhysicalResourceId.of(
+            `${this.stackName}-cert-describe`,
+          ),
+        },
+        onUpdate: {
+          service: 'ACM',
+          action: 'describeCertificate',
+          region: 'us-east-1',
+          parameters: { CertificateArn: certificateArn },
+          physicalResourceId: cr.PhysicalResourceId.of(
+            `${this.stackName}-cert-describe`,
+          ),
+        },
+        policy: certPolicy,
+        installLatestAwsSdk: false,
+      });
+      describeCertCr.node.addDependency(requestCertCr);
+
+      certificateStatusForOutput = describeCertCr.getResponseField(
+        'Certificate.Status',
       );
-    } catch (_e) {
-      certStatusFromSsm = 'PENDING_VALIDATION';
+
+      // Read the validation records — apex + www → two records typically.
+      // ACM returns DomainValidationOptions as an array; each entry has
+      // ResourceRecord.{Name,Type,Value}. Tokens here resolve at deploy time.
+      apexValidationName = describeCertCr.getResponseField(
+        'Certificate.DomainValidationOptions.0.ResourceRecord.Name',
+      );
+      apexValidationType = describeCertCr.getResponseField(
+        'Certificate.DomainValidationOptions.0.ResourceRecord.Type',
+      );
+      apexValidationValue = describeCertCr.getResponseField(
+        'Certificate.DomainValidationOptions.0.ResourceRecord.Value',
+      );
+      wwwValidationName = describeCertCr.getResponseField(
+        'Certificate.DomainValidationOptions.1.ResourceRecord.Name',
+      );
+      wwwValidationType = describeCertCr.getResponseField(
+        'Certificate.DomainValidationOptions.1.ResourceRecord.Type',
+      );
+      wwwValidationValue = describeCertCr.getResponseField(
+        'Certificate.DomainValidationOptions.1.ResourceRecord.Value',
+      );
+
+      // Write the status to SSM so the next synth's valueFromLookup picks it up.
+      const certStatusParamName = `/hereya/${this.stackName}/certStatus`;
+      const putCertStatusCr = new cr.AwsCustomResource(
+        this,
+        'PutCertStatusCr',
+        {
+          resourceType: 'Custom::HereyaPutCertStatus',
+          onCreate: {
+            service: 'SSM',
+            action: 'putParameter',
+            parameters: {
+              Name: certStatusParamName,
+              Value: certificateStatusForOutput,
+              Type: 'String',
+              Overwrite: true,
+            },
+            physicalResourceId: cr.PhysicalResourceId.of(
+              `${this.stackName}-cert-status`,
+            ),
+          },
+          onUpdate: {
+            service: 'SSM',
+            action: 'putParameter',
+            parameters: {
+              Name: certStatusParamName,
+              Value: certificateStatusForOutput,
+              Type: 'String',
+              Overwrite: true,
+            },
+            physicalResourceId: cr.PhysicalResourceId.of(
+              `${this.stackName}-cert-status`,
+            ),
+          },
+          onDelete: {
+            service: 'SSM',
+            action: 'deleteParameter',
+            parameters: { Name: certStatusParamName },
+            ignoreErrorCodesMatching: 'ParameterNotFound',
+          },
+          policy: cr.AwsCustomResourcePolicy.fromStatements([
+            new iam.PolicyStatement({
+              actions: [
+                'ssm:PutParameter',
+                'ssm:DeleteParameter',
+                'ssm:GetParameter',
+              ],
+              resources: ['*'],
+            }),
+          ]),
+          installLatestAwsSdk: false,
+        },
+      );
+      putCertStatusCr.node.addDependency(describeCertCr);
+
+      // SSM-lookup gating: the third arg is a default returned when the
+      // parameter is missing (very first synth).
+      let certStatusFromSsm = 'PENDING_VALIDATION';
+      try {
+        certStatusFromSsm = ssm.StringParameter.valueFromLookup(
+          this,
+          certStatusParamName,
+          'PENDING_VALIDATION',
+        );
+      } catch (_e) {
+        certStatusFromSsm = 'PENDING_VALIDATION';
+      }
+      aliasesEnabledForDistribution = certStatusFromSsm === 'ISSUED';
+      if (aliasesEnabledForDistribution) {
+        certificateForDistribution = acm.Certificate.fromCertificateArn(
+          this,
+          'CertRef',
+          certificateArn,
+        );
+      }
     }
-    const aliasesEnabled = certStatusFromSsm === 'ISSUED';
 
     // -----------------------------------------------------------------------
     // 8. S3 bucket + CloudFront distribution
@@ -565,14 +654,10 @@ export class AppStack extends cdk.Stack {
             },
           ]
         : undefined,
-      ...(aliasesEnabled
+      ...(aliasesEnabledForDistribution && certificateForDistribution
         ? {
             domainNames: [domain, `www.${domain}`],
-            certificate: acm.Certificate.fromCertificateArn(
-              this,
-              'CertRef',
-              certificateArn,
-            ),
+            certificate: certificateForDistribution,
           }
         : {}),
     };
@@ -582,6 +667,44 @@ export class AppStack extends cdk.Stack {
       'Distribution',
       distributionProps,
     );
+
+    // -----------------------------------------------------------------------
+    // 8b. Route 53 ALIAS records — only in auto-Route53 mode.
+    //
+    // CloudFront targets must be reached via Route 53 ALIAS A/AAAA records
+    // (CNAMEs at the zone apex are not legal). We create both apex and www
+    // since the cert covers both. The www alias works in tandem with the
+    // CloudFront Function's www→apex 301 redirect; the alias just terminates
+    // TLS so the redirect can fire on HTTPS.
+    // -----------------------------------------------------------------------
+
+    if (manageDnsInRoute53 && hostedZoneForAliases) {
+      const aliasTarget = route53.RecordTarget.fromAlias(
+        new route53Targets.CloudFrontTarget(distribution),
+      );
+
+      new route53.ARecord(this, 'AppApexAlias', {
+        zone: hostedZoneForAliases,
+        recordName: domain,
+        target: aliasTarget,
+      });
+      new route53.AaaaRecord(this, 'AppApexAliasAaaa', {
+        zone: hostedZoneForAliases,
+        recordName: domain,
+        target: aliasTarget,
+      });
+
+      new route53.ARecord(this, 'AppWwwAlias', {
+        zone: hostedZoneForAliases,
+        recordName: `www.${domain}`,
+        target: aliasTarget,
+      });
+      new route53.AaaaRecord(this, 'AppWwwAliasAaaa', {
+        zone: hostedZoneForAliases,
+        recordName: `www.${domain}`,
+        target: aliasTarget,
+      });
+    }
 
     // -----------------------------------------------------------------------
     // 10. BucketDeployment — frontend assets + invalidate /*
@@ -621,114 +744,114 @@ export class AppStack extends cdk.Stack {
     });
 
     new CfnOutput(this, 'certificateArn', {
-      value: certificateArn,
+      value: certificateArnForOutput,
       description: 'ARN of the ACM certificate (us-east-1)',
     });
 
     new CfnOutput(this, 'certificateStatus', {
-      value: certificateStatus,
+      value: certificateStatusForOutput,
       description:
-        'Live status of the ACM cert as observed by the custom resource',
+        'Live status of the ACM cert (ISSUED in auto-Route53 mode; ' +
+        'observed-by-CR value in external-DNS mode)',
     });
 
-    // DNS records the user must add in their external DNS provider.
-    new CfnOutput(this, 'dnsRecordCertValidationApexName', {
-      value: apexValidationName,
-      description: 'ACM cert validation CNAME name (apex)',
-    });
-    new CfnOutput(this, 'dnsRecordCertValidationApexType', {
-      value: apexValidationType,
-      description: 'ACM cert validation CNAME type (apex)',
-    });
-    new CfnOutput(this, 'dnsRecordCertValidationApexValue', {
-      value: apexValidationValue,
-      description: 'ACM cert validation CNAME value (apex)',
-    });
-    new CfnOutput(this, 'dnsRecordCertValidationWwwName', {
-      value: wwwValidationName,
-      description: 'ACM cert validation CNAME name (www)',
-    });
-    new CfnOutput(this, 'dnsRecordCertValidationWwwType', {
-      value: wwwValidationType,
-      description: 'ACM cert validation CNAME type (www)',
-    });
-    new CfnOutput(this, 'dnsRecordCertValidationWwwValue', {
-      value: wwwValidationValue,
-      description: 'ACM cert validation CNAME value (www)',
-    });
-
-    new CfnOutput(this, 'dnsRecordCloudfrontApex', {
-      value: JSON.stringify({
-        // Use Fn substitution at synth-time
-        name: domain,
-        type: 'CNAME or ALIAS',
-        value: '<see distribution.distributionDomainName output>',
-      }),
+    new CfnOutput(this, 'manageDnsInRoute53', {
+      value: String(manageDnsInRoute53),
       description:
-        'DNS record for apex → CloudFront (CNAME flat or ALIAS depending on provider)',
-    });
-    new CfnOutput(this, 'dnsRecordCloudfrontApexName', { value: domain });
-    new CfnOutput(this, 'dnsRecordCloudfrontApexType', {
-      value: 'CNAME',
-      description: 'Use ALIAS/ANAME at apex if your DNS provider supports it',
-    });
-    new CfnOutput(this, 'dnsRecordCloudfrontApexValue', {
-      value: distribution.distributionDomainName,
+        'True when the stack auto-creates DNS in Route 53 (no manual records needed)',
     });
 
-    new CfnOutput(this, 'dnsRecordCloudfrontWwwName', {
-      value: `www.${domain}`,
-    });
-    new CfnOutput(this, 'dnsRecordCloudfrontWwwType', { value: 'CNAME' });
-    new CfnOutput(this, 'dnsRecordCloudfrontWwwValue', {
-      value: distribution.distributionDomainName,
-    });
+    // External-DNS-mode-only outputs: records the user must add manually.
+    // In auto-Route53 mode these are no-ops (records are created by the stack).
+    if (!manageDnsInRoute53) {
+      new CfnOutput(this, 'dnsRecordCertValidationApexName', {
+        value: apexValidationName,
+        description: 'ACM cert validation CNAME name (apex)',
+      });
+      new CfnOutput(this, 'dnsRecordCertValidationApexType', {
+        value: apexValidationType,
+        description: 'ACM cert validation CNAME type (apex)',
+      });
+      new CfnOutput(this, 'dnsRecordCertValidationApexValue', {
+        value: apexValidationValue,
+        description: 'ACM cert validation CNAME value (apex)',
+      });
+      new CfnOutput(this, 'dnsRecordCertValidationWwwName', {
+        value: wwwValidationName,
+        description: 'ACM cert validation CNAME name (www)',
+      });
+      new CfnOutput(this, 'dnsRecordCertValidationWwwType', {
+        value: wwwValidationType,
+        description: 'ACM cert validation CNAME type (www)',
+      });
+      new CfnOutput(this, 'dnsRecordCertValidationWwwValue', {
+        value: wwwValidationValue,
+        description: 'ACM cert validation CNAME value (www)',
+      });
 
-    // Aggregated convenience output — single JSON array for copy-paste.
-    // Note: `Fn.sub` is used to embed token-resolved values into a JSON shell.
-    const dnsRecordsToAddJson = cdk.Fn.sub(
-      JSON.stringify([
-        {
-          purpose: 'acm-validation-apex',
-          name: '${ApexValidationName}',
-          type: '${ApexValidationType}',
-          value: '${ApexValidationValue}',
-        },
-        {
-          purpose: 'acm-validation-www',
-          name: '${WwwValidationName}',
-          type: '${WwwValidationType}',
-          value: '${WwwValidationValue}',
-        },
-        {
-          purpose: 'cloudfront-apex',
-          name: domain,
-          type: 'CNAME',
-          value: '${CloudfrontDomain}',
-        },
-        {
-          purpose: 'cloudfront-www',
-          name: `www.${domain}`,
-          type: 'CNAME',
-          value: '${CloudfrontDomain}',
-        },
-      ]),
-      {
-        ApexValidationName: apexValidationName,
-        ApexValidationType: apexValidationType,
-        ApexValidationValue: apexValidationValue,
-        WwwValidationName: wwwValidationName,
-        WwwValidationType: wwwValidationType,
-        WwwValidationValue: wwwValidationValue,
-        CloudfrontDomain: distribution.distributionDomainName,
-      },
-    );
+      new CfnOutput(this, 'dnsRecordCloudfrontApexName', { value: domain });
+      new CfnOutput(this, 'dnsRecordCloudfrontApexType', {
+        value: 'CNAME',
+        description:
+          'Use ALIAS/ANAME at apex if your DNS provider supports it',
+      });
+      new CfnOutput(this, 'dnsRecordCloudfrontApexValue', {
+        value: distribution.distributionDomainName,
+      });
 
-    new CfnOutput(this, 'dnsRecordsToAdd', {
-      value: dnsRecordsToAddJson,
-      description:
-        'Aggregated JSON array of all DNS records to add in your external DNS provider',
-    });
+      new CfnOutput(this, 'dnsRecordCloudfrontWwwName', {
+        value: `www.${domain}`,
+      });
+      new CfnOutput(this, 'dnsRecordCloudfrontWwwType', { value: 'CNAME' });
+      new CfnOutput(this, 'dnsRecordCloudfrontWwwValue', {
+        value: distribution.distributionDomainName,
+      });
+
+      // Aggregated convenience output — single JSON array for copy-paste.
+      const dnsRecordsToAddJson = cdk.Fn.sub(
+        JSON.stringify([
+          {
+            purpose: 'acm-validation-apex',
+            name: '${ApexValidationName}',
+            type: '${ApexValidationType}',
+            value: '${ApexValidationValue}',
+          },
+          {
+            purpose: 'acm-validation-www',
+            name: '${WwwValidationName}',
+            type: '${WwwValidationType}',
+            value: '${WwwValidationValue}',
+          },
+          {
+            purpose: 'cloudfront-apex',
+            name: domain,
+            type: 'CNAME',
+            value: '${CloudfrontDomain}',
+          },
+          {
+            purpose: 'cloudfront-www',
+            name: `www.${domain}`,
+            type: 'CNAME',
+            value: '${CloudfrontDomain}',
+          },
+        ]),
+        {
+          ApexValidationName: apexValidationName,
+          ApexValidationType: apexValidationType,
+          ApexValidationValue: apexValidationValue,
+          WwwValidationName: wwwValidationName,
+          WwwValidationType: wwwValidationType,
+          WwwValidationValue: wwwValidationValue,
+          CloudfrontDomain: distribution.distributionDomainName,
+        },
+      );
+
+      new CfnOutput(this, 'dnsRecordsToAdd', {
+        value: dnsRecordsToAddJson,
+        description:
+          'Aggregated JSON array of all DNS records to add in your external DNS provider',
+      });
+    }
   }
 }
 
