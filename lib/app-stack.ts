@@ -66,8 +66,18 @@ export class AppStack extends cdk.Stack {
       domain = `${subdomainName}.${defaultRootDomain}`;
       manageDnsInRoute53 = true;
     } else if (defaultRootDomain) {
-      // No subdomain pinned. Fall back to stackName as a stable per-stack label.
-      domain = `${this.stackName.toLowerCase()}.${defaultRootDomain}`;
+      // No subdomain pinned and no upstream `effectiveDomain`. Derive a
+      // short, stable, DNS-friendly label from a hash of the stack name —
+      // the raw stackName may be a long opaque id like "p-<guid>" in
+      // the hereya CDK harness, which is not domain-friendly.
+      const stableLabel =
+        'app-' +
+        crypto
+          .createHash('sha256')
+          .update(this.stackName)
+          .digest('hex')
+          .slice(0, 8);
+      domain = `${stableLabel}.${defaultRootDomain}`;
       manageDnsInRoute53 = true;
     } else {
       throw new Error(
