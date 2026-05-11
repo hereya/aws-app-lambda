@@ -50,8 +50,11 @@ export class AppStack extends cdk.Stack {
     const isSpa = process.env['isSpa'] === 'true';
 
     // Migration support — when truthy (default), create a sibling Lambda that
-    // runs Drizzle migrations and gate the app Lambda on it via a CFn Custom
-    // Resource. Set `runMigrations=false` to opt out (e.g. backend without a DB).
+    // runs database migrations and gate the app Lambda on it via a CFn Custom
+    // Resource. The migration Lambda's handler is user-defined (see
+    // `migrationHandler`); it can use any tool (Drizzle, node-pg-migrate,
+    // Prisma, raw SQL, Knex, etc.) — the CDK does not import any migration
+    // library. Set `runMigrations=false` to opt out (e.g. backend without a DB).
     const runMigrationsEnabled =
       (process.env['runMigrations'] ?? 'true') !== 'false';
     const migrationHandler =
@@ -62,6 +65,21 @@ export class AppStack extends cdk.Stack {
     const migrationMemoryMb = process.env['migrationMemoryMb']
       ? parseInt(process.env['migrationMemoryMb'])
       : 512;
+    // Folder inside the backend bundle whose contents are hashed to decide
+    // when to re-fire the migration Custom Resource. Default matches Drizzle's
+    // `drizzle-kit generate` output. Override for other tools (e.g. `migrations`
+    // for node-pg-migrate, `prisma/migrations` for Prisma, etc.).
+    const migrationHashFolder =
+      process.env['migrationHashFolder'] ?? 'drizzle';
+    // Comma-separated list of file extensions counted when hashing the folder.
+    // Default `.sql` covers most tools; set to `.sql,.js` etc. if your tool
+    // emits other files that should also trigger re-runs.
+    const migrationHashExtensions = (
+      process.env['migrationHashExtensions'] ?? '.sql'
+    )
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
 
     // -----------------------------------------------------------------------
     // 2. Parse hereyaProjectEnv and split into policy / secret / plain
@@ -158,13 +176,18 @@ export class AppStack extends cdk.Stack {
     configureFunction(fn);
 
     // -----------------------------------------------------------------------
-    // 4a. Migration Lambda + Custom Resource (option B: deploy-time migrations)
+    // 4a. Migration Lambda + Custom Resource (deploy-time migrations)
     //
-    // The migration Lambda imports the same backend bundle. A CloudFormation
-    // Custom Resource invokes it on every Create/Update — but only when the
-    // contents of the `drizzle/` migration folder change (we hash the folder
-    // at synth time and pass the hash as a CR property, so CFn re-fires the
-    // CR only when migrations have actually been added/edited).
+    // The migration Lambda imports the same backend bundle as the app Lambda;
+    // its handler (default `migrate.handler`) is user-defined and may run
+    // any tool (Drizzle, node-pg-migrate, Prisma, raw SQL, Knex, etc.). A
+    // CloudFormation Custom Resource invokes the handler on every Create/Update
+    // — but only when the contents of the configured migration-hash folder
+    // change (we hash the folder at synth time and pass the hash as a CR
+    // property, so CFn re-fires the CR only when migrations have actually
+    // been added/edited). The folder defaults to `drizzle` (the Drizzle CLI's
+    // output) but is fully configurable via `migrationHashFolder` +
+    // `migrationHashExtensions`.
     //
     // The app Lambda has an explicit dependency on the migration CR, so the
     // stack will not switch traffic to a new app version until migrations
@@ -188,7 +211,8 @@ export class AppStack extends cdk.Stack {
       });
 
       const migrationHash = hashMigrationFolder(
-        path.join(hereyaProjectRootDir, backendDistFolder, 'drizzle'),
+        path.join(hereyaProjectRootDir, backendDistFolder, migrationHashFolder),
+        migrationHashExtensions,
       );
 
       migrationResource = new cdk.CustomResource(this, 'MigrationResource', {
@@ -712,23 +736,38 @@ export class AppStack extends cdk.Stack {
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Hashes the contents of the drizzle migrations folder (filenames + content)
-// at synth time. The result is fed into the migration Custom Resource so CFn
-// re-invokes the CR only when actual migration files change. If the folder is
-// missing or empty (very first build before any `db:generate`), we return a
-// stable sentinel — the CR still fires once on initial Create, then no-ops
-// until migrations exist.
-function hashMigrationFolder(folder: string): string {
+// Hashes the contents of the migrations folder (filenames + content) at synth
+// time. The result is fed into the migration Custom Resource so CFn re-invokes
+// the CR only when actual migration files change. Tool-agnostic — works for
+// Drizzle (.sql files in drizzle/), node-pg-migrate (.sql in migrations/),
+// Prisma (.sql in prisma/migrations/), or any tool that emits a stable folder
+// of versioned files. If the folder is missing or empty (very first build
+// before any migrations exist), we return a stable sentinel — the CR still
+// fires once on initial Create, then no-ops until migrations exist.
+//
+// Recursive walk so nested layouts (Prisma's per-migration subfolders) work.
+function hashMigrationFolder(folder: string, extensions: string[]): string {
   if (!fs.existsSync(folder)) return 'no-migrations';
-  const entries = fs
-    .readdirSync(folder)
-    .filter((f) => f.endsWith('.sql'))
-    .sort();
-  if (entries.length === 0) return 'no-migrations';
+  const matched: string[] = [];
+  const walk = (dir: string, prefix: string): void => {
+    for (const ent of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) =>
+      a.name.localeCompare(b.name),
+    )) {
+      const abs = path.join(dir, ent.name);
+      const rel = prefix ? `${prefix}/${ent.name}` : ent.name;
+      if (ent.isDirectory()) {
+        walk(abs, rel);
+      } else if (extensions.some((ext) => ent.name.endsWith(ext))) {
+        matched.push(rel);
+      }
+    }
+  };
+  walk(folder, '');
+  if (matched.length === 0) return 'no-migrations';
   const h = crypto.createHash('sha256');
-  for (const name of entries) {
-    h.update(name);
-    h.update(fs.readFileSync(path.join(folder, name)));
+  for (const rel of matched) {
+    h.update(rel);
+    h.update(fs.readFileSync(path.join(folder, rel)));
   }
   return h.digest('hex').slice(0, 16);
 }
