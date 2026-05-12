@@ -621,8 +621,15 @@ export class AppStack extends cdk.Stack {
           },
         ],
       },
-      additionalBehaviors: {
-        '/api/*': {
+      additionalBehaviors: (() => {
+        // The Lambda origin is shared by every backend behavior — the
+        // /api/* surface for normal app traffic plus a handful of well-
+        // known paths the MCP / OAuth specs require to live OUTSIDE
+        // /api/* (RFC 8414 metadata MUST be at /.well-known/... at the
+        // hosted-resource root, MCP clients connect to a clean /mcp,
+        // etc.). All routes get the same caching-disabled + all-viewer
+        // policy pair as /api/*.
+        const apiBehavior: cloudfront.BehaviorOptions = {
           origin: new origins.HttpOrigin(apiOriginDomain, {
             protocolPolicy: cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
           }),
@@ -631,8 +638,25 @@ export class AppStack extends cdk.Stack {
           allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
           cachePolicy: apiCachePolicy,
           originRequestPolicy: apiOriginRequestPolicy,
-        },
-      },
+        };
+        return {
+          '/api/*': apiBehavior,
+          // MCP Streamable-HTTP endpoint. POSTed JSON-RPC. Single
+          // pattern, exact match — sub-paths under /mcp/* aren't used
+          // by the transport in stateless mode.
+          '/mcp': apiBehavior,
+          // OAuth 2.1 authorization server (per the MCP auth spec):
+          // /oauth/authorize, /oauth/token, /oauth/register, …
+          '/oauth/*': apiBehavior,
+          // RFC 8414 (auth-server metadata) + RFC 9728 (protected-
+          // resource metadata, served at <resource>/.well-known/...).
+          // Both metadata documents and any future well-known route
+          // are routed to the Lambda. Note the wildcard captures the
+          // entire .well-known subtree — if you ever add ACME http-01
+          // challenge files you'll want a more specific behavior.
+          '/.well-known/*': apiBehavior,
+        };
+      })(),
       errorResponses: isSpa
         ? [
             {
