@@ -169,8 +169,17 @@ export class AppStack extends cdk.Stack {
       ),
     );
 
-    // Always expose `domain` to the Lambda so app code can read it.
+    // Always expose `domain` AND the canonical public `appUrl` to the
+    // Lambda so app code can build absolute URLs (e.g. OAuth issuer in
+    // /.well-known/oauth-authorization-server) without trying to derive
+    // them from the incoming request — `Host` is stripped by the
+    // ALL_VIEWER_EXCEPT_HOST_HEADER origin request policy, so `req.url`
+    // surfaces the API Gateway origin, not the public domain.
+    //
+    // The CfnOutput further below has the same value — the env var is
+    // simply the runtime-side mirror of the deploy-side output.
     plainEnv['domain'] = domain;
+    plainEnv['appUrl'] = `https://${domain}`;
 
     // -----------------------------------------------------------------------
     // 3. One consolidated Secrets Manager secret (only if any secret:// entries)
