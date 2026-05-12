@@ -1,3 +1,4 @@
+import { execSync } from 'node:child_process';
 import * as cdk from 'aws-cdk-lib';
 import { CfnOutput, SecretValue } from 'aws-cdk-lib';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
@@ -337,13 +338,6 @@ export class AppStack extends cdk.Stack {
     let certificateArnForOutput = '';
     let certificateStatusForOutput = '';
     let hostedZoneForAliases: route53.IHostedZone | undefined;
-    // External-DNS-mode-only: CFn condition that gates the Distribution's
-    // alias / ViewerCertificate properties on the live cert status. The
-    // condition is evaluated at deploy time, so the SAME template covers
-    // both the "cert still PENDING" deploy (pass 1: aliases skipped) and
-    // the "cert now ISSUED" deploy (pass 2: aliases attached) without
-    // needing a synth-time SSM round-trip.
-    let isCertIssuedCondition: cdk.CfnCondition | undefined;
 
     // Validation-record outputs (only populated in external mode).
     let apexValidationName = '';
@@ -513,28 +507,40 @@ export class AppStack extends cdk.Stack {
         'Certificate.DomainValidationOptions.1.ResourceRecord.Value',
       );
 
-      // Build a CFn condition gated on the live cert status. The condition
-      // is evaluated at deploy time, so the SAME template covers both the
-      // "cert still PENDING" deploy (condition false → alias fields elided)
-      // and the "cert ISSUED" deploy (condition true → alias fields
-      // populated). No SSM, no synth-time AWS read, no extra deploy pass.
-      isCertIssuedCondition = new cdk.CfnCondition(this, 'IsCertIssued', {
-        expression: cdk.Fn.conditionEquals(
-          certificateStatusForOutput,
-          'ISSUED',
-        ),
-      });
-
-      // Always wire the cert into the Distribution props. The Aliases /
-      // ViewerCertificate properties land in the CFn template unconditionally;
-      // the override block below replaces them with `Fn::If(IsCertIssued, …)`
-      // so CloudFront sees them only when the cert is actually usable.
-      certificateForDistribution = acm.Certificate.fromCertificateArn(
-        this,
-        'CertRef',
-        certificateArn,
-      );
-      aliasesEnabledForDistribution = true;
+      // Read the cert's live status from ACM at synth time and decide
+      // whether to include alias config in the template. Keyed on domain
+      // name (known at synth) — no SSM, no per-stack state.
+      //
+      // Pass 1: no cert in ACM yet (the deploy is about to create it via
+      // RequestCertCr) → list returns empty → status = NOT_FOUND → aliases
+      // off → Distribution comes up on default *.cloudfront.net cert.
+      // Validation DNS records emitted as outputs for the user.
+      //
+      // Pass 2: cert exists in ACM and (post DNS-record propagation) has
+      // status = ISSUED → aliases on → Distribution updated with aliases
+      // + ACM cert in the same deploy.
+      //
+      // Why this works: ACM cert is the single source of truth, queried
+      // directly. No CR caching, no SSM, no context-provider quirks.
+      const certStatus = (() => {
+        try {
+          const out = execSync(
+            `aws acm list-certificates --region us-east-1 --query "CertificateSummaryList[?DomainName=='${domain}'].Status | [0]" --output text`,
+            { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+          ).trim();
+          return out || 'NOT_FOUND';
+        } catch {
+          return 'NOT_FOUND';
+        }
+      })();
+      aliasesEnabledForDistribution = certStatus === 'ISSUED';
+      if (aliasesEnabledForDistribution) {
+        certificateForDistribution = acm.Certificate.fromCertificateArn(
+          this,
+          'CertRef',
+          certificateArn,
+        );
+      }
     }
 
     // -----------------------------------------------------------------------
@@ -671,37 +677,6 @@ export class AppStack extends cdk.Stack {
       'Distribution',
       distributionProps,
     );
-
-    // External-DNS mode: gate the Distribution's alias / ViewerCertificate
-    // fields on the live cert status via Fn::If. CloudFront would otherwise
-    // refuse the update with InvalidViewerCertificate on the first deploy
-    // (cert still PENDING), rolling back the whole stack. With these
-    // overrides, pass 1 brings the Distribution up on the default
-    // *.cloudfront.net cert and pass 2 (after DNS records are added and
-    // ACM validates) flips the alias fields on in a single deploy.
-    if (isCertIssuedCondition) {
-      const cfnDist = distribution.node.defaultChild as cloudfront.CfnDistribution;
-      cfnDist.addPropertyOverride(
-        'DistributionConfig.Aliases',
-        cdk.Fn.conditionIf(
-          isCertIssuedCondition.logicalId,
-          [domain, `www.${domain}`],
-          cdk.Aws.NO_VALUE,
-        ),
-      );
-      cfnDist.addPropertyOverride(
-        'DistributionConfig.ViewerCertificate',
-        cdk.Fn.conditionIf(
-          isCertIssuedCondition.logicalId,
-          {
-            AcmCertificateArn: certificateArnForOutput,
-            SslSupportMethod: 'sni-only',
-            MinimumProtocolVersion: 'TLSv1.2_2021',
-          },
-          { CloudFrontDefaultCertificate: true },
-        ),
-      );
-    }
 
     // -----------------------------------------------------------------------
     // 8b. Route 53 ALIAS records — only in auto-Route53 mode.
