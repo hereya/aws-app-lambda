@@ -563,6 +563,14 @@ export class AppStack extends cdk.Stack {
         certStatusParamName,
         'PENDING_VALIDATION',
       );
+      // Synth-time diagnostic (remove once cert-status flow is validated end-to-end).
+      // Surfaces in executor logs so we can see exactly what lookup returned —
+      // distinguishing "lookup returned ISSUED but alias-attach broken" from
+      // "lookup never returned ISSUED (env-agnostic stack? IAM? cache?)".
+      // eslint-disable-next-line no-console
+      console.log(
+        `[hereya/aws-app-lambda] cert-status lookup: param=${certStatusParamName} value=${JSON.stringify(certStatusFromSsm)} account=${this.account} region=${this.region}`,
+      );
       aliasesEnabledForDistribution = certStatusFromSsm === 'ISSUED';
       if (aliasesEnabledForDistribution) {
         certificateForDistribution = acm.Certificate.fromCertificateArn(
