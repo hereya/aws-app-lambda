@@ -549,18 +549,20 @@ export class AppStack extends cdk.Stack {
       );
       putCertStatusCr.node.addDependency(describeCertCr);
 
-      // SSM-lookup gating: the third arg is a default returned when the
-      // parameter is missing (very first synth).
-      let certStatusFromSsm = 'PENDING_VALIDATION';
-      try {
-        certStatusFromSsm = ssm.StringParameter.valueFromLookup(
-          this,
-          certStatusParamName,
-          'PENDING_VALIDATION',
-        );
-      } catch (_e) {
-        certStatusFromSsm = 'PENDING_VALIDATION';
-      }
+      // SSM-lookup gating. The third arg is the default returned when the
+      // parameter is missing (very first synth, before PutCertStatusCr has
+      // ever written it). Do NOT wrap this in try/catch: CDK's lookup
+      // mechanism signals "context not yet resolved" by throwing a special
+      // MissingContextLookup error that the CLI catches to auto-resolve
+      // the value via AWS API and re-run synth. Swallowing that error here
+      // breaks the auto-resolve — synth then permanently returns the
+      // default and the alias-attach branch never lights up even after the
+      // SSM value flips to ISSUED.
+      const certStatusFromSsm = ssm.StringParameter.valueFromLookup(
+        this,
+        certStatusParamName,
+        'PENDING_VALIDATION',
+      );
       aliasesEnabledForDistribution = certStatusFromSsm === 'ISSUED';
       if (aliasesEnabledForDistribution) {
         certificateForDistribution = acm.Certificate.fromCertificateArn(
