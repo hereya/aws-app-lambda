@@ -450,8 +450,15 @@ export class AppStack extends cdk.Stack {
           action: 'describeCertificate',
           region: 'us-east-1',
           parameters: { CertificateArn: certificateArn },
+          // Synth-time timestamp so each `hereya deploy` produces a
+          // different Properties block. Without this CFn dedupes byte-
+          // identical CR properties and never re-invokes the Lambda,
+          // so a still-PENDING_VALIDATION cert at create-time stays
+          // stuck — the package needs the deploy chain to be able to
+          // observe a freshly-validated cert without a property change
+          // elsewhere in the stack.
           physicalResourceId: cr.PhysicalResourceId.of(
-            `${this.stackName}-cert-describe`,
+            `${this.stackName}-cert-describe-${Date.now()}`,
           ),
         },
         policy: certPolicy,
@@ -514,8 +521,11 @@ export class AppStack extends cdk.Stack {
               Type: 'String',
               Overwrite: true,
             },
+            // Match DescribeCertCr above: fresh physicalResourceId per
+            // synth so CFn re-invokes this Lambda and the SSM value
+            // tracks the live cert status across deploys.
             physicalResourceId: cr.PhysicalResourceId.of(
-              `${this.stackName}-cert-status`,
+              `${this.stackName}-cert-status-${Date.now()}`,
             ),
           },
           onDelete: {
