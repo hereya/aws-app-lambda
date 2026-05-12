@@ -1,4 +1,3 @@
-import { execSync } from 'node:child_process';
 import * as cdk from 'aws-cdk-lib';
 import { CfnOutput, SecretValue } from 'aws-cdk-lib';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
@@ -338,6 +337,13 @@ export class AppStack extends cdk.Stack {
     let certificateArnForOutput = '';
     let certificateStatusForOutput = '';
     let hostedZoneForAliases: route53.IHostedZone | undefined;
+    // External-DNS-mode-only: CFn condition that gates the Distribution's
+    // alias / ViewerCertificate properties on the live cert status. The
+    // condition is evaluated at deploy time, so the SAME template covers
+    // both the "cert still PENDING" deploy (pass 1: aliases skipped) and
+    // the "cert now ISSUED" deploy (pass 2: aliases attached) without
+    // needing a synth-time SSM round-trip.
+    let isCertIssuedCondition: cdk.CfnCondition | undefined;
 
     // Validation-record outputs (only populated in external mode).
     let apexValidationName = '';
@@ -371,13 +377,28 @@ export class AppStack extends cdk.Stack {
       certificateStatusForOutput = 'ISSUED'; // synchronously waited for by the construct
       aliasesEnabledForDistribution = true;
     } else {
-      // ------------------- External DNS mode (legacy 3-CR flow) -------------------
+      // ------------------- External DNS mode (2-deploy flow) -------------------
       //
-      // First synth: SSM parameter does not exist → valueFromLookup returns
-      // 'PENDING_VALIDATION'. aliasesEnabled is false → distribution comes
-      // up without aliases. The user adds the emitted DNS records. After the
-      // next deploy describes the cert as ISSUED, the SSM write captures it
-      // and the THIRD deploy flips aliases on.
+      // Two custom resources:
+      //   a. RequestCertificate (idempotent via IdempotencyToken = hash(stackName))
+      //   b. DescribeCertificate (captures Status + DomainValidationOptions)
+      //
+      // The Distribution's alias / ViewerCertificate fields are gated by a
+      // CloudFormation CONDITION (`IsCertIssued`) evaluated against
+      // DescribeCertCr's live `Certificate.Status` response at deploy time.
+      // Pass 1: cert is PENDING → condition false → Distribution comes up
+      // without aliases, validation DNS records emitted. User adds DNS
+      // records, cert flips to ISSUED in ACM. Pass 2: condition true →
+      // aliases + ACM cert attached in the same deploy.
+      //
+      // Why CfnCondition rather than a synth-time SSM lookup:
+      //   • valueFromLookup's context provider silently returns the
+      //     supplied default on AccessDenied / missing-param, with no way
+      //     to distinguish from a real PENDING_VALIDATION.
+      //   • SSM round-trip required a third deploy because synth ran
+      //     before the CR could write the updated status.
+      //   • A CFn Condition is the single source of truth, evaluated
+      //     once per deploy against the live cert.
 
       const idempotencyToken = crypto
         .createHash('sha256')
@@ -391,7 +412,6 @@ export class AppStack extends cdk.Stack {
             'acm:RequestCertificate',
             'acm:DescribeCertificate',
             'acm:ListCertificates',
-            'ssm:PutParameter',
           ],
           resources: ['*'],
         }),
@@ -493,98 +513,28 @@ export class AppStack extends cdk.Stack {
         'Certificate.DomainValidationOptions.1.ResourceRecord.Value',
       );
 
-      // Write the status to SSM so the next synth's valueFromLookup picks it up.
-      const certStatusParamName = `/hereya/${this.stackName}/certStatus`;
-      const putCertStatusCr = new cr.AwsCustomResource(
-        this,
-        'PutCertStatusCr',
-        {
-          resourceType: 'Custom::HereyaPutCertStatus',
-          onCreate: {
-            service: 'SSM',
-            action: 'putParameter',
-            parameters: {
-              Name: certStatusParamName,
-              Value: certificateStatusForOutput,
-              Type: 'String',
-              Overwrite: true,
-            },
-            physicalResourceId: cr.PhysicalResourceId.of(
-              `${this.stackName}-cert-status`,
-            ),
-          },
-          onUpdate: {
-            service: 'SSM',
-            action: 'putParameter',
-            parameters: {
-              Name: certStatusParamName,
-              Value: certificateStatusForOutput,
-              Type: 'String',
-              Overwrite: true,
-            },
-            // Match DescribeCertCr above: fresh physicalResourceId per
-            // synth so CFn re-invokes this Lambda and the SSM value
-            // tracks the live cert status across deploys.
-            physicalResourceId: cr.PhysicalResourceId.of(
-              `${this.stackName}-cert-status-${Date.now()}`,
-            ),
-          },
-          onDelete: {
-            service: 'SSM',
-            action: 'deleteParameter',
-            parameters: { Name: certStatusParamName },
-            ignoreErrorCodesMatching: 'ParameterNotFound',
-          },
-          policy: cr.AwsCustomResourcePolicy.fromStatements([
-            new iam.PolicyStatement({
-              actions: [
-                'ssm:PutParameter',
-                'ssm:DeleteParameter',
-                'ssm:GetParameter',
-              ],
-              resources: ['*'],
-            }),
-          ]),
-          installLatestAwsSdk: false,
-        },
-      );
-      putCertStatusCr.node.addDependency(describeCertCr);
+      // Build a CFn condition gated on the live cert status. The condition
+      // is evaluated at deploy time, so the SAME template covers both the
+      // "cert still PENDING" deploy (condition false → alias fields elided)
+      // and the "cert ISSUED" deploy (condition true → alias fields
+      // populated). No SSM, no synth-time AWS read, no extra deploy pass.
+      isCertIssuedCondition = new cdk.CfnCondition(this, 'IsCertIssued', {
+        expression: cdk.Fn.conditionEquals(
+          certificateStatusForOutput,
+          'ISSUED',
+        ),
+      });
 
-      // Read the previously-written cert status from SSM at synth time.
-      //
-      // `ssm.StringParameter.valueFromLookup` was the obvious fit, but its
-      // context-provider path silently returns the supplied default value
-      // on AccessDenied / missing-parameter / cache-miss — there's no way
-      // to distinguish "param really has value X" from "we couldn't read
-      // it" without making the absence-case throw. That bit us: the cert
-      // would flip to ISSUED in SSM but the lookup kept returning the
-      // PENDING_VALIDATION default, so the alias-attach branch never
-      // lit up.
-      //
-      // Shell out to AWS CLI directly. The executor already has AWS CLI
-      // + creds (it's about to run cdk deploy with the same identity),
-      // exit code 0 means the parameter was read, anything else means
-      // it doesn't exist yet — which is the legitimate "first synth"
-      // case, so we fall back to PENDING_VALIDATION there.
-      let certStatusFromSsm = 'PENDING_VALIDATION';
-      try {
-        const region = this.region || process.env.AWS_REGION || 'eu-west-1';
-        certStatusFromSsm = execSync(
-          `aws ssm get-parameter --region ${region} --name ${certStatusParamName} --query 'Parameter.Value' --output text`,
-          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
-        ).trim();
-      } catch {
-        // Parameter doesn't exist yet (first synth before PutCertStatusCr
-        // has ever written it) or transient read error. Leave default.
-      }
-      aliasesEnabledForDistribution = certStatusFromSsm === 'ISSUED';
-      if (aliasesEnabledForDistribution) {
-        certificateForDistribution = acm.Certificate.fromCertificateArn(
-          this,
-          'CertRef',
-          certificateArn,
-        );
-      }
+      // Always wire the cert into the Distribution props. The Aliases /
+      // ViewerCertificate properties land in the CFn template unconditionally;
+      // the override block below replaces them with `Fn::If(IsCertIssued, …)`
+      // so CloudFront sees them only when the cert is actually usable.
+      certificateForDistribution = acm.Certificate.fromCertificateArn(
+        this,
+        'CertRef',
+        certificateArn,
+      );
+      aliasesEnabledForDistribution = true;
     }
 
     // -----------------------------------------------------------------------
@@ -721,6 +671,37 @@ export class AppStack extends cdk.Stack {
       'Distribution',
       distributionProps,
     );
+
+    // External-DNS mode: gate the Distribution's alias / ViewerCertificate
+    // fields on the live cert status via Fn::If. CloudFront would otherwise
+    // refuse the update with InvalidViewerCertificate on the first deploy
+    // (cert still PENDING), rolling back the whole stack. With these
+    // overrides, pass 1 brings the Distribution up on the default
+    // *.cloudfront.net cert and pass 2 (after DNS records are added and
+    // ACM validates) flips the alias fields on in a single deploy.
+    if (isCertIssuedCondition) {
+      const cfnDist = distribution.node.defaultChild as cloudfront.CfnDistribution;
+      cfnDist.addPropertyOverride(
+        'DistributionConfig.Aliases',
+        cdk.Fn.conditionIf(
+          isCertIssuedCondition.logicalId,
+          [domain, `www.${domain}`],
+          cdk.Aws.NO_VALUE,
+        ),
+      );
+      cfnDist.addPropertyOverride(
+        'DistributionConfig.ViewerCertificate',
+        cdk.Fn.conditionIf(
+          isCertIssuedCondition.logicalId,
+          {
+            AcmCertificateArn: certificateArnForOutput,
+            SslSupportMethod: 'sni-only',
+            MinimumProtocolVersion: 'TLSv1.2_2021',
+          },
+          { CloudFrontDefaultCertificate: true },
+        ),
+      );
+    }
 
     // -----------------------------------------------------------------------
     // 8b. Route 53 ALIAS records — only in auto-Route53 mode.
