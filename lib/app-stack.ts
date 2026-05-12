@@ -1,3 +1,4 @@
+import { execSync } from 'node:child_process';
 import * as cdk from 'aws-cdk-lib';
 import { CfnOutput, SecretValue } from 'aws-cdk-lib';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
@@ -549,28 +550,33 @@ export class AppStack extends cdk.Stack {
       );
       putCertStatusCr.node.addDependency(describeCertCr);
 
-      // SSM-lookup gating. The third arg is the default returned when the
-      // parameter is missing (very first synth, before PutCertStatusCr has
-      // ever written it). Do NOT wrap this in try/catch: CDK's lookup
-      // mechanism signals "context not yet resolved" by throwing a special
-      // MissingContextLookup error that the CLI catches to auto-resolve
-      // the value via AWS API and re-run synth. Swallowing that error here
-      // breaks the auto-resolve — synth then permanently returns the
-      // default and the alias-attach branch never lights up even after the
-      // SSM value flips to ISSUED.
-      const certStatusFromSsm = ssm.StringParameter.valueFromLookup(
-        this,
-        certStatusParamName,
-        'PENDING_VALIDATION',
-      );
-      // Synth-time diagnostic (remove once cert-status flow is validated end-to-end).
-      // Surfaces in executor logs so we can see exactly what lookup returned —
-      // distinguishing "lookup returned ISSUED but alias-attach broken" from
-      // "lookup never returned ISSUED (env-agnostic stack? IAM? cache?)".
-      // eslint-disable-next-line no-console
-      console.log(
-        `[hereya/aws-app-lambda] cert-status lookup: param=${certStatusParamName} value=${JSON.stringify(certStatusFromSsm)} account=${this.account} region=${this.region}`,
-      );
+      // Read the previously-written cert status from SSM at synth time.
+      //
+      // `ssm.StringParameter.valueFromLookup` was the obvious fit, but its
+      // context-provider path silently returns the supplied default value
+      // on AccessDenied / missing-parameter / cache-miss — there's no way
+      // to distinguish "param really has value X" from "we couldn't read
+      // it" without making the absence-case throw. That bit us: the cert
+      // would flip to ISSUED in SSM but the lookup kept returning the
+      // PENDING_VALIDATION default, so the alias-attach branch never
+      // lit up.
+      //
+      // Shell out to AWS CLI directly. The executor already has AWS CLI
+      // + creds (it's about to run cdk deploy with the same identity),
+      // exit code 0 means the parameter was read, anything else means
+      // it doesn't exist yet — which is the legitimate "first synth"
+      // case, so we fall back to PENDING_VALIDATION there.
+      let certStatusFromSsm = 'PENDING_VALIDATION';
+      try {
+        const region = this.region || process.env.AWS_REGION || 'eu-west-1';
+        certStatusFromSsm = execSync(
+          `aws ssm get-parameter --region ${region} --name ${certStatusParamName} --query 'Parameter.Value' --output text`,
+          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+        ).trim();
+      } catch {
+        // Parameter doesn't exist yet (first synth before PutCertStatusCr
+        // has ever written it) or transient read error. Leave default.
+      }
       aliasesEnabledForDistribution = certStatusFromSsm === 'ISSUED';
       if (aliasesEnabledForDistribution) {
         certificateForDistribution = acm.Certificate.fromCertificateArn(
