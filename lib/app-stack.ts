@@ -448,64 +448,114 @@ export class AppStack extends cdk.Stack {
       const certificateArn = requestCertCr.getResponseField('CertificateArn');
       certificateArnForOutput = certificateArn;
 
-      // Describe the cert — captures Status + DomainValidationOptions
-      const describeCertCr = new cr.AwsCustomResource(this, 'DescribeCertCr', {
+      // Describe the cert — captures Status + DomainValidationOptions for
+      // BOTH the apex and www SAN. ACM has a known race here: when you
+      // request a cert with `SubjectAlternativeNames`, ACM populates
+      // `DomainValidationOptions[0].ResourceRecord` (apex) immediately but
+      // takes a few extra seconds to fill in `DomainValidationOptions[1]`
+      // (www). A one-shot AwsCustomResource that queries DescribeCertificate
+      // right after RequestCertificate caches that partial response, and
+      // any downstream Fn::GetAtt for the www record then errors with
+      // "Vendor response doesn't contain ... attribute", which rolls the
+      // whole stack back.
+      //
+      // Fix: a small inline Lambda that polls DescribeCertificate every
+      // few seconds until both DomainValidationOptions entries have their
+      // ResourceRecord populated, then returns the values as flat top-level
+      // attributes. Wrapped in `cr.Provider` so we don't have to implement
+      // the CFn custom-resource response protocol by hand.
+      const describeCertOnEvent = new lambda.Function(
+        this,
+        'DescribeCertOnEvent',
+        {
+          runtime: lambda.Runtime.NODEJS_22_X,
+          handler: 'index.handler',
+          timeout: cdk.Duration.minutes(3),
+          // Inline so the package stays single-file. AWS SDK v3 client-acm
+          // is bundled with the Node 22 runtime — no `installLatestAwsSdk`
+          // dance, no separate asset to ship.
+          code: lambda.Code.fromInline(`
+const { ACMClient, DescribeCertificateCommand } = require('@aws-sdk/client-acm');
+
+exports.handler = async (event) => {
+  const { RequestType, ResourceProperties = {} } = event;
+  if (RequestType === 'Delete') {
+    return { PhysicalResourceId: event.PhysicalResourceId };
+  }
+  const certArn = ResourceProperties.CertificateArn;
+  const region = ResourceProperties.Region || 'us-east-1';
+  const client = new ACMClient({ region });
+  const maxAttempts = 30; // 30 * 5s = 150s max
+  const delayMs = 5000;
+  for (let i = 0; i < maxAttempts; i++) {
+    const result = await client.send(new DescribeCertificateCommand({ CertificateArn: certArn }));
+    const dvo = (result.Certificate && result.Certificate.DomainValidationOptions) || [];
+    const allReady = dvo.length >= 2 && dvo.every(d => d.ResourceRecord && d.ResourceRecord.Name);
+    if (allReady) {
+      return {
+        PhysicalResourceId: 'cert-describe-' + certArn,
+        Data: {
+          Status: result.Certificate.Status,
+          ApexValidationName: dvo[0].ResourceRecord.Name,
+          ApexValidationType: dvo[0].ResourceRecord.Type,
+          ApexValidationValue: dvo[0].ResourceRecord.Value,
+          WwwValidationName: dvo[1].ResourceRecord.Name,
+          WwwValidationType: dvo[1].ResourceRecord.Type,
+          WwwValidationValue: dvo[1].ResourceRecord.Value,
+        },
+      };
+    }
+    console.log('[describe-cert] DomainValidationOptions not yet fully populated (attempt ' + (i + 1) + '/' + maxAttempts + '); sleeping ' + delayMs + 'ms');
+    await new Promise(r => setTimeout(r, delayMs));
+  }
+  throw new Error('Timeout: ACM did not populate DomainValidationOptions for ' + certArn + ' after ' + (maxAttempts * delayMs / 1000) + 's');
+};
+`),
+          initialPolicy: [
+            new iam.PolicyStatement({
+              actions: ['acm:DescribeCertificate'],
+              resources: ['*'],
+            }),
+          ],
+        },
+      );
+
+      const describeCertProvider = new cr.Provider(
+        this,
+        'DescribeCertProvider',
+        {
+          onEventHandler: describeCertOnEvent,
+        },
+      );
+
+      const describeCertCr = new cdk.CustomResource(this, 'DescribeCertCr', {
         resourceType: 'Custom::HereyaDescribeCertificate',
-        onCreate: {
-          service: 'ACM',
-          action: 'describeCertificate',
-          region: 'us-east-1',
-          parameters: { CertificateArn: certificateArn },
-          physicalResourceId: cr.PhysicalResourceId.of(
-            `${this.stackName}-cert-describe`,
-          ),
-        },
-        onUpdate: {
-          service: 'ACM',
-          action: 'describeCertificate',
-          region: 'us-east-1',
-          parameters: { CertificateArn: certificateArn },
+        serviceToken: describeCertProvider.serviceToken,
+        properties: {
+          CertificateArn: certificateArn,
+          Region: 'us-east-1',
           // Synth-time timestamp so each `hereya deploy` produces a
-          // different Properties block. Without this CFn dedupes byte-
-          // identical CR properties and never re-invokes the Lambda,
-          // so a still-PENDING_VALIDATION cert at create-time stays
-          // stuck — the package needs the deploy chain to be able to
-          // observe a freshly-validated cert without a property change
-          // elsewhere in the stack.
-          physicalResourceId: cr.PhysicalResourceId.of(
-            `${this.stackName}-cert-describe-${Date.now()}`,
-          ),
+          // different Properties block; CFn dedupes byte-identical
+          // properties and skips re-invocation otherwise, so a still-
+          // PENDING_VALIDATION cert at create-time would stay cached and
+          // the alias-attach branch would never light up across deploys.
+          Trigger: new Date().toISOString(),
         },
-        policy: certPolicy,
-        installLatestAwsSdk: false,
       });
       describeCertCr.node.addDependency(requestCertCr);
 
-      certificateStatusForOutput = describeCertCr.getResponseField(
-        'Certificate.Status',
-      );
+      certificateStatusForOutput = describeCertCr.getAtt('Status').toString();
 
-      // Read the validation records — apex + www → two records typically.
-      // ACM returns DomainValidationOptions as an array; each entry has
-      // ResourceRecord.{Name,Type,Value}. Tokens here resolve at deploy time.
-      apexValidationName = describeCertCr.getResponseField(
-        'Certificate.DomainValidationOptions.0.ResourceRecord.Name',
-      );
-      apexValidationType = describeCertCr.getResponseField(
-        'Certificate.DomainValidationOptions.0.ResourceRecord.Type',
-      );
-      apexValidationValue = describeCertCr.getResponseField(
-        'Certificate.DomainValidationOptions.0.ResourceRecord.Value',
-      );
-      wwwValidationName = describeCertCr.getResponseField(
-        'Certificate.DomainValidationOptions.1.ResourceRecord.Name',
-      );
-      wwwValidationType = describeCertCr.getResponseField(
-        'Certificate.DomainValidationOptions.1.ResourceRecord.Type',
-      );
-      wwwValidationValue = describeCertCr.getResponseField(
-        'Certificate.DomainValidationOptions.1.ResourceRecord.Value',
-      );
+      // Validation records — apex + www. The Lambda flattened them into
+      // top-level Data fields, so we read them via getAtt by name rather
+      // than the old AwsCustomResource `Certificate.DomainValidationOptions.N.…`
+      // path. Tokens here resolve at deploy time as before.
+      apexValidationName = describeCertCr.getAtt('ApexValidationName').toString();
+      apexValidationType = describeCertCr.getAtt('ApexValidationType').toString();
+      apexValidationValue = describeCertCr.getAtt('ApexValidationValue').toString();
+      wwwValidationName = describeCertCr.getAtt('WwwValidationName').toString();
+      wwwValidationType = describeCertCr.getAtt('WwwValidationType').toString();
+      wwwValidationValue = describeCertCr.getAtt('WwwValidationValue').toString();
 
       // Read the cert's live status from ACM at synth time and decide
       // whether to include alias config in the template. Keyed on domain
