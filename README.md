@@ -8,7 +8,7 @@ Single CDK stack that provisions a fullstack app's runtime + delivery on AWS:
 - **CloudFront distribution** with two behaviors:
   - `/api/*` → API Gateway origin (`AllowedMethods.ALLOW_ALL`, `CachePolicy.CACHING_DISABLED`, origin-request forwards cookie `hereya_sid` + `Authorization` + `Content-Type`)
   - default `*` → S3 origin (cached, optional SPA fallback to `/index.html` when `isSpa=true`)
-- **ACM certificate** in `us-east-1` for `domain` + `www.${domain}`, provisioned via three chained `cr.AwsCustomResource` calls (RequestCertificate → DescribeCertificate → PutParameter on `/hereya/${stackName}/certStatus`). **Non-blocking** — the deploy completes before the cert is validated.
+- **ACM certificate** in `us-east-1` for `domain` + `www.${domain}`. Two modes: auto-Route 53 (single deploy, `DnsValidatedCertificate` validated against the workspace's hosted zone) or external DNS (two deploys, `RequestCertificate` + `AddTagsToCertificate` + `DescribeCertificate` custom resources). The cert is tagged with `hereya:stackName=<stack>` after creation so that a tag-filtered synth-time lookup can find THIS stack's cert without colliding with unrelated certs for the same hostname elsewhere in the account. **Non-blocking** in external mode — pass 1 completes on the default `*.cloudfront.net` cert and emits the DNS records the operator must add.
 - **CloudFront Function** on the default behavior: `www → apex 301` + URL rewrite (SPA or MPA).
 - **Consolidated Secrets Manager secret** — every `secret://`-prefixed env var collected into one JSON secret. Lambda receives `HEREYA_SECRETS_ARN`; the Lambda is expected to read and inject those values on cold start (see template's `secrets.ts`).
 - **IAM auto-attach** — any env var with key matching `iamPolicy*` / `IAM_POLICY_*` is JSON-parsed and its `Statement[]` is attached to the Lambda role.
@@ -43,11 +43,17 @@ Single CDK stack that provisions a fullstack app's runtime + delivery on AWS:
 | `dnsRecordCloudfrontWww{Name,Type,Value}` | CNAME `www.${domain}` → CloudFront |
 | `dnsRecordsToAdd` | Aggregated JSON array of all records |
 
-## Two-deploy ACM flow
+## Two-deploy ACM flow (external DNS)
 
-1. **First `hereya deploy`** — Stack creates the cert (status `PENDING_VALIDATION`), brings up the distribution at `https://dxxxx.cloudfront.net` (no aliases), and outputs every DNS record the user must add (cert validation CNAMEs + CloudFront apex/www CNAMEs).
-2. User adds the records in their external DNS provider. ACM validates the cert (~5–30 min).
-3. **Second `hereya deploy`** — Synth-time `ssm.StringParameter.valueFromLookup('/hereya/<stack>/certStatus')` reads `ISSUED`, so the distribution is reconfigured with `domainNames: [domain, www.${domain}]` and the cert is attached. CloudFront propagates (~5–15 min). The app is now live at `https://${domain}`.
+1. **First `hereya deploy`** — `RequestCertCr` creates the cert (status `PENDING_VALIDATION`); `TagCertCr` stamps it with `Tags=[{hereya:stackName=<stack>}]`; `DescribeCertCr` polls until both apex + www `DomainValidationOptions` are populated and emits them as flat top-level attributes. The synth-time lookup finds no tagged cert yet, so the distribution comes up at `https://dxxxx.cloudfront.net` on the default `*.cloudfront.net` cert with no Aliases. Every DNS record the operator must add (cert validation CNAMEs + CloudFront apex/www CNAMEs) is emitted as a stack output.
+2. Operator adds the records in their external DNS provider. ACM validates the cert (~5–30 min).
+3. **Second `hereya deploy`** — synth-time `aws acm list-certificates` + `list-tags-for-certificate` + `describe-certificate` pipeline finds this stack's tagged cert in `ISSUED` status. The L2 Distribution gets `domainNames: [domain, www.${domain}]` and `certificate: <ARN>` props; CFn updates ViewerCertificate + Aliases in one deploy. CloudFront propagates (~5–15 min). The app is now live at `https://${domain}`.
+
+> The lookup filters on **this stack's** tag (`hereya:stackName=<stack>`), not just `DomainName`, so a stale ACM cert for the same hostname elsewhere in the account (e.g. from a previously hand-rolled CloudFront) cannot trick the gate into reporting ISSUED and attaching this stack's freshly-requested PENDING cert. Fixed in `0.5.3`.
+
+> **Why not a deploy-time CFn Condition keyed on `DescribeCertCr.Status`?** CloudFormation evaluates Conditions before resource creation, so a Condition referencing a resource attribute fails with `Unresolved dependencies [DescribeCertCr]`. v0.5.0 tried this and had to be reverted (commit a7125e4); v0.5.3 keeps the synth-time gate from v0.5.1 but scopes the lookup by tag.
+
+> **Upgrading from `<0.5.3`.** Transparent. `RequestCertCr`'s Properties are byte-identical to <0.5.3 (same domain + SANs + IdempotencyToken hash), so CFn does not fire the CR's Update event and ACM does not mint a new cert — the existing cert stays. The new `TagCertCr` resource Creates on first 0.5.3 deploy and tags the existing cert. On that first deploy the synth-time lookup hits a fallback: it queries CloudFormation for the stack's prior `certificateArn` output, uses that ARN's live Status, and aliases stay attached for the whole upgrade. Subsequent deploys use the by-tag fast path.
 
 ## Secret-injection pattern
 

@@ -13,7 +13,6 @@ import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import { BucketDeployment, Source } from 'aws-cdk-lib/aws-s3-deployment';
-import * as ssm from 'aws-cdk-lib/aws-ssm';
 import * as cr from 'aws-cdk-lib/custom-resources';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
@@ -323,13 +322,16 @@ export class AppStack extends cdk.Stack {
     // and validates it via Route 53 in the looked-up hosted zone. One
     // deploy. Aliases are attached immediately.
     //
-    // External mode: legacy non-blocking flow with three chained
-    // custom resources:
-    //   a. RequestCertificate (idempotent via IdempotencyToken = hash(stackName))
-    //   b. DescribeCertificate (capture Status + DomainValidationOptions)
-    //   c. PutParameter (write /hereya/<stackName>/certStatus for next synth)
-    // Three deploys: first creates the cert + emits DNS records, user adds
-    // them, second captures ISSUED, third flips aliases on.
+    // External mode: two-pass, non-blocking flow with three custom
+    // resources — RequestCertificate (cert lifecycle), TagCertCr
+    // (stamps `hereya:stackName=<this>` on the cert), and
+    // DescribeCertificate (polls for validation records + Status).
+    // Whether the L2 Distribution gets domainNames + cert is gated
+    // by a SYNTH-time AWS lookup that prefers the tagged cert and
+    // falls back to the prior CFn `certificateArn` output so existing
+    // <0.5.3 deploys upgrade without re-issuing the cert. See the
+    // long comment block in the External-DNS branch below for the
+    // per-scenario flow.
     // -----------------------------------------------------------------------
 
     // Branch state — populated by whichever path runs below.
@@ -373,27 +375,84 @@ export class AppStack extends cdk.Stack {
     } else {
       // ------------------- External DNS mode (2-deploy flow) -------------------
       //
-      // Two custom resources:
-      //   a. RequestCertificate (idempotent via IdempotencyToken = hash(stackName))
-      //   b. DescribeCertificate (captures Status + DomainValidationOptions)
+      // Three custom resources:
+      //   a. RequestCertificate — idempotent via IdempotencyToken.
+      //      Inputs are stable across versions; do not change them or
+      //      ACM will mint a new cert and orphan the existing one on
+      //      upgrade (ACM's idempotency window is ~1h, long expired
+      //      for any deploy that's been running for a while).
+      //   b. AddTagsToCertificate — runs after (a) and tags the cert
+      //      with `hereya:stackName=<this.stackName>` so a synth-time
+      //      lookup can pick THIS stack's cert out of any other certs
+      //      that may exist in the account for the same hostname.
+      //      Implemented as a separate CR rather than the `Tags`
+      //      inline param on (a) precisely so (a)'s Properties stay
+      //      byte-identical and existing <0.5.3 deploys can upgrade
+      //      without re-issuing the cert.
+      //   c. DescribeCertificate — polls until DomainValidationOptions
+      //      are populated; returns Status + flattened validation
+      //      records (used as CFn outputs for the operator).
       //
-      // The Distribution's alias / ViewerCertificate fields are gated by a
-      // CloudFormation CONDITION (`IsCertIssued`) evaluated against
-      // DescribeCertCr's live `Certificate.Status` response at deploy time.
-      // Pass 1: cert is PENDING → condition false → Distribution comes up
-      // without aliases, validation DNS records emitted. User adds DNS
-      // records, cert flips to ISSUED in ACM. Pass 2: condition true →
-      // aliases + ACM cert attached in the same deploy.
+      // Whether the L2 Distribution gets domainNames + cert is decided
+      // at SYNTH time by readTaggedCertStatus(): list ACM certs in
+      // us-east-1 matching the domain, narrow to the one tagged for
+      // this stack, return its Status. On the very first 0.5.3 deploy
+      // of an existing <0.5.3 stack the tag isn't there YET (TagCertCr
+      // runs at deploy time, AFTER synth), so the helper falls back to
+      // reading this stack's prior `certificateArn` CloudFormation
+      // output and uses that ARN's live Status. Subsequent deploys hit
+      // the by-tag fast path directly.
       //
-      // Why CfnCondition rather than a synth-time SSM lookup:
-      //   • valueFromLookup's context provider silently returns the
-      //     supplied default on AccessDenied / missing-param, with no way
-      //     to distinguish from a real PENDING_VALIDATION.
-      //   • SSM round-trip required a third deploy because synth ran
-      //     before the CR could write the updated status.
-      //   • A CFn Condition is the single source of truth, evaluated
-      //     once per deploy against the live cert.
+      // Flow per scenario:
+      //   • Existing successful <0.5.3 stack upgrades to 0.5.3:
+      //       synth Phase 1: no tagged cert → Phase 2: stack output
+      //       points at existing cert → ISSUED → aliases stay on.
+      //       Deploy: RequestCertCr unchanged (byte-identical) → not
+      //       re-invoked. TagCertCr Creates → tags existing cert.
+      //       No outage, no cert churn.
+      //   • Fresh stack, pass 1:
+      //       synth: no tagged cert, no prior output → NOT_FOUND →
+      //       aliases off, Distribution comes up on default
+      //       *.cloudfront.net cert. Deploy: RequestCertCr creates a
+      //       new cert; TagCertCr tags it. DNS records emitted as
+      //       outputs. Operator copies records to their DNS provider;
+      //       ACM validates; cert flips to ISSUED.
+      //   • Fresh stack, pass 2:
+      //       synth: tagged cert found, Status = ISSUED → aliases on.
+      //       Distribution updated with aliases + cert in one deploy.
+      //
+      // Why the tag scopes the lookup (and not just DomainName):
+      //   A pre-existing ISSUED cert for the same hostname elsewhere
+      //   in the account — e.g. left over from a previously hand-
+      //   rolled CloudFront — would otherwise satisfy a by-domain
+      //   lookup. The stack would mark aliases enabled and wire this
+      //   stack's freshly-requested PENDING cert into the
+      //   Distribution; CFn deploys the change; CloudFront rejects
+      //   any ViewerCertificate that isn't ISSUED with a 400 and
+      //   rolls the whole stack back before any DNS-record outputs
+      //   are emitted. The tag (and the stack-output fallback) scope
+      //   the lookup to certs THIS stack owns.
+      //
+      // Why synth-time and not a deploy-time CFn Condition keyed on
+      // `Fn::GetAtt: [DescribeCertCr, Status]`:
+      //   CloudFormation evaluates Conditions before resources are
+      //   created. A Condition that depends on a resource attribute
+      //   fails with "Unresolved dependencies [<resource>]". An
+      //   earlier 0.5.0 build tried exactly that and had to be
+      //   reverted (commit a7125e4) — synth-time is the only path
+      //   that works without a third deploy.
 
+      // CRITICAL: do not change this token or any other RequestCertCr
+      // input across versions. ACM's IdempotencyToken window is ~1h,
+      // which means existing deploys' certs have long since aged out
+      // of the window — so any change to this CR's Properties would
+      // cause CFn to fire the CR's Update event, and ACM (outside the
+      // window) would mint a brand-new cert. That would orphan the
+      // existing cert, drop the Distribution's aliases until the new
+      // cert is validated, and force the operator to add a fresh set
+      // of ACM validation records. Tagging in 0.5.3 is therefore done
+      // by a SEPARATE TagCertCr below (new resource, only fires
+      // Create), not by adding Tags inline here.
       const idempotencyToken = crypto
         .createHash('sha256')
         .update(`${this.stackName}-cert-v1`)
@@ -447,6 +506,56 @@ export class AppStack extends cdk.Stack {
 
       const certificateArn = requestCertCr.getResponseField('CertificateArn');
       certificateArnForOutput = certificateArn;
+
+      // Tag the cert with this stack's name so the synth-time
+      // tag-filtered lookup below can pick it out of any other cert
+      // in the account that happens to share the same DomainName.
+      //
+      // We use a SEPARATE custom resource (not the Tags inline param
+      // on RequestCertificate above) for backward compatibility: this
+      // CR is new in 0.5.3, so on existing <0.5.3 stacks CFn creates
+      // it for the first time and tags whichever cert RequestCertCr
+      // currently references — without disturbing RequestCertCr
+      // itself, whose Properties stay byte-identical to <0.5.3 so CFn
+      // does not fire its Update event and ACM does not mint a fresh
+      // cert. On fresh stacks the CR Creates against the cert that
+      // RequestCertCr just minted, also tagging it. Either way the
+      // tag is in place by the time the next deploy's synth runs.
+      const tagCertCr = new cr.AwsCustomResource(this, 'TagCertCr', {
+        resourceType: 'Custom::HereyaTagCertificate',
+        onCreate: {
+          service: 'ACM',
+          action: 'addTagsToCertificate',
+          region: 'us-east-1',
+          parameters: {
+            CertificateArn: certificateArn,
+            Tags: [{ Key: 'hereya:stackName', Value: this.stackName }],
+          },
+          physicalResourceId: cr.PhysicalResourceId.of(
+            `${this.stackName}-cert-tag-v1`,
+          ),
+        },
+        onUpdate: {
+          service: 'ACM',
+          action: 'addTagsToCertificate',
+          region: 'us-east-1',
+          parameters: {
+            CertificateArn: certificateArn,
+            Tags: [{ Key: 'hereya:stackName', Value: this.stackName }],
+          },
+          physicalResourceId: cr.PhysicalResourceId.of(
+            `${this.stackName}-cert-tag-v1`,
+          ),
+        },
+        policy: cr.AwsCustomResourcePolicy.fromStatements([
+          new iam.PolicyStatement({
+            actions: ['acm:AddTagsToCertificate'],
+            resources: ['*'],
+          }),
+        ]),
+        installLatestAwsSdk: false,
+      });
+      tagCertCr.node.addDependency(requestCertCr);
 
       // Describe the cert — captures Status + DomainValidationOptions for
       // BOTH the apex and www SAN. ACM has a known race here: when you
@@ -557,32 +666,37 @@ exports.handler = async (event) => {
       wwwValidationType = describeCertCr.getAtt('WwwValidationType').toString();
       wwwValidationValue = describeCertCr.getAtt('WwwValidationValue').toString();
 
-      // Read the cert's live status from ACM at synth time and decide
-      // whether to include alias config in the template. Keyed on domain
-      // name (known at synth) — no SSM, no per-stack state.
+      // Synth-time lookup: read the live Status of THIS stack's cert
+      // (identified by the `hereya:stackName` tag) and use it to decide
+      // whether the L2 Distribution gets aliases + cert this deploy.
       //
-      // Pass 1: no cert in ACM yet (the deploy is about to create it via
-      // RequestCertCr) → list returns empty → status = NOT_FOUND → aliases
-      // off → Distribution comes up on default *.cloudfront.net cert.
-      // Validation DNS records emitted as outputs for the user.
+      //   pass 1: RequestCertCr hasn't run yet → no cert exists with
+      //   our tag → NOT_FOUND → aliases off → distribution comes up
+      //   on the default *.cloudfront.net cert + emits DNS records.
       //
-      // Pass 2: cert exists in ACM and (post DNS-record propagation) has
-      // status = ISSUED → aliases on → Distribution updated with aliases
-      // + ACM cert in the same deploy.
+      //   pass 2: tagged cert exists in ACM. Status is whatever ACM
+      //   currently reports — ISSUED if the operator has added the
+      //   DNS records and ACM has validated, still PENDING_VALIDATION
+      //   otherwise (deploy is a no-op for the alias config in that
+      //   case; the operator runs hereya deploy again later).
       //
-      // Why this works: ACM cert is the single source of truth, queried
-      // directly. No CR caching, no SSM, no context-provider quirks.
-      const certStatus = (() => {
-        try {
-          const out = execSync(
-            `aws acm list-certificates --region us-east-1 --query "CertificateSummaryList[?DomainName=='${domain}'].Status | [0]" --output text`,
-            { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
-          ).trim();
-          return out || 'NOT_FOUND';
-        } catch {
-          return 'NOT_FOUND';
-        }
-      })();
+      // The pipeline is intentionally three small `aws` calls rather
+      // than one because:
+      //   • ListCertificates can return SUMMARY rows but not tags.
+      //   • Filtering by tag therefore needs ListTagsForCertificate
+      //     per candidate ARN.
+      //   • DescribeCertificate gives the authoritative Status.
+      // In practice the candidate list is 1–2 ARNs for a given domain,
+      // so the loop is cheap.
+      const certStatus = readTaggedCertStatus({
+        certRegion: 'us-east-1',
+        stackRegion:
+          process.env['CDK_DEFAULT_REGION'] ??
+          process.env['awsRegion'] ??
+          'us-east-1',
+        domain,
+        stackName: this.stackName,
+      });
       aliasesEnabledForDistribution = certStatus === 'ISSUED';
       if (aliasesEnabledForDistribution) {
         certificateForDistribution = acm.Certificate.fromCertificateArn(
@@ -953,6 +1067,83 @@ function hashMigrationFolder(folder: string, extensions: string[]): string {
     h.update(fs.readFileSync(path.join(folder, rel)));
   }
   return h.digest('hex').slice(0, 16);
+}
+
+// Reads the live Status of the ACM cert this stack uses. Two phases:
+//
+//   1. By-tag (preferred): list ACM certs in `certRegion` matching
+//      the domain, fetch tags per candidate, pick the one carrying
+//      `hereya:stackName=<stackName>`, return its Status.
+//
+//   2. By-stack-output (backward-compat fallback): if no tagged cert
+//      is found, query CloudFormation for THIS stack's prior
+//      `certificateArn` output. If present, describe that cert; if
+//      its DomainName matches, return its Status. This handles the
+//      first 0.5.3 deploy of an existing <0.5.3 stack — the cert
+//      isn't tagged YET (TagCertCr runs at deploy time, AFTER this
+//      synth-time lookup), but the stack's own output tells us
+//      unambiguously which cert is ours.
+//
+// Returns 'NOT_FOUND' on first-ever deploy of a new stack (no cert
+// exists yet, no prior output), on any AWS error (treated as "cert
+// isn't ready"), or when no candidate carries our tag and no prior
+// output points at a matching cert.
+function readTaggedCertStatus(opts: {
+  certRegion: string;
+  stackRegion: string;
+  domain: string;
+  stackName: string;
+}): string {
+  const { certRegion, stackRegion, domain, stackName } = opts;
+  const sh = (cmd: string): string =>
+    execSync(cmd, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+
+  // Phase 1: by-tag lookup.
+  try {
+    const candidateArns = sh(
+      `aws acm list-certificates --region ${certRegion} --query "CertificateSummaryList[?DomainName=='${domain}'].CertificateArn" --output text`,
+    )
+      .split(/\s+/)
+      .filter(Boolean);
+    for (const arn of candidateArns) {
+      const tagMatchCount = sh(
+        `aws acm list-tags-for-certificate --region ${certRegion} --certificate-arn ${arn} --query "Tags[?Key=='hereya:stackName' && Value=='${stackName}'] | length(@)" --output text`,
+      );
+      if (tagMatchCount === '1') {
+        const status = sh(
+          `aws acm describe-certificate --region ${certRegion} --certificate-arn ${arn} --query Certificate.Status --output text`,
+        );
+        return status || 'NOT_FOUND';
+      }
+    }
+  } catch {
+    /* fall through to phase 2 */
+  }
+
+  // Phase 2: backward-compat fallback via prior stack output.
+  try {
+    const prevArn = sh(
+      `aws cloudformation describe-stacks --region ${stackRegion} --stack-name ${stackName} --query "Stacks[0].Outputs[?OutputKey=='certificateArn'].OutputValue | [0]" --output text`,
+    );
+    if (prevArn && prevArn !== 'None' && prevArn.startsWith('arn:')) {
+      const describeOut = sh(
+        `aws acm describe-certificate --region ${certRegion} --certificate-arn ${prevArn} --query "Certificate.[DomainName,Status]" --output text`,
+      );
+      // describe-certificate --output text gives tab-separated
+      // values; split on whitespace tolerates both.
+      const [certDomain, certStatus] = describeOut.split(/\s+/);
+      if (certDomain === domain && certStatus) {
+        return certStatus;
+      }
+    }
+  } catch {
+    /* nothing more to try */
+  }
+
+  return 'NOT_FOUND';
 }
 
 function resolveNodeRuntime(input: string | undefined): lambda.Runtime {
