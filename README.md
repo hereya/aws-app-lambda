@@ -27,6 +27,43 @@ Single CDK stack that provisions a fullstack app's runtime + delivery on AWS:
 | `lambdaTimeoutSec` | no | `30` | Lambda timeout |
 | `nodeRuntime` | no | `nodejs22.x` | Lambda runtime (`nodejs18.x` / `nodejs20.x` / `nodejs22.x`) |
 | `isSpa` | no | `false` | SPA fallback on static origin |
+| `runMigrations` | no | `true` | Create the migration Lambda + its Custom Resource |
+| `migrationHandler` | no | `migrate.handler` | Migration handler export, inside the same backend bundle |
+| `migrationHashFolder` | no | `drizzle` | Folder (inside the bundle) whose files decide when migrations re-run |
+| `migrationHashExtensions` | no | `.sql` | Extensions counted when hashing that folder |
+| `migrationTimeoutSec` | no | `300` | Migration Lambda timeout |
+| `migrationMemoryMb` | no | `512` | Migration Lambda memory |
+
+## Deploy-time migrations — when do they actually run?
+
+The migration Lambda is invoked by a CloudFormation Custom Resource, and a
+Custom Resource only fires when **one of its properties changes**. That property
+is a hash, computed at synth time from two inputs:
+
+1. the **migration folder** (`migrationHashFolder`, `.sql` by default), and
+2. the **compiled migration handler** itself (`migrate.js` & co).
+
+**The second input landed in 0.5.4, and it is a fix, not a refinement.** Before
+that, only the folder was hashed — so a project whose migrations are *code*
+rather than `.sql` files (one-shot functions gated by a sentinel row, the usual
+shape for a key/value store) hashed a folder that did not exist, got the
+constant `no-migrations`, and its Custom Resource fired **exactly once, at stack
+creation**. The handler was redeployed on every deploy thereafter and never
+invoked again. Migrations shipped, were believed applied, and did nothing —
+silently, because nothing errors in that state.
+
+Practical consequences:
+
+- **Upgrading to 0.5.4 changes the hash for every existing stack**, so the
+  Custom Resource fires once on the next deploy. That is the intended healing
+  step. Your migration runner must be idempotent — Drizzle's is, and the
+  sentinel pattern is by construction.
+- Afterwards, migrations re-run whenever the backend bundle's migration handler
+  changes, which is precisely when you have added one.
+- The cost of a redundant fire is one Lambda invocation that no-ops. Nothing is
+  replaced or recreated: the Custom Resource gates the app Lambda's rollout, it
+  does not rebuild it.
+- Set `runMigrations=false` if your backend has no database at all.
 
 ## Outputs
 

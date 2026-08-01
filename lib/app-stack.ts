@@ -271,18 +271,21 @@ export class AppStack extends cdk.Stack {
         onEventHandler: migrationFn,
       });
 
-      const migrationHash = hashMigrationFolder(
-        path.join(hereyaProjectRootDir, backendDistFolder, migrationHashFolder),
-        migrationHashExtensions,
-      );
+      const backendDistDir = path.join(hereyaProjectRootDir, backendDistFolder);
+      const migrationHash = hashMigrationInputs({
+        folder: path.join(backendDistDir, migrationHashFolder),
+        extensions: migrationHashExtensions,
+        handlerFile: migrationHandlerFile(backendDistDir, migrationHandler),
+      });
 
       migrationResource = new cdk.CustomResource(this, 'MigrationResource', {
         serviceToken: migrationProvider.serviceToken,
         resourceType: 'Custom::HereyaAppMigrations',
         properties: {
-          // Re-runs the CR only when the migration files change. Drizzle's
-          // migrator is idempotent so this is safe either way; this just
-          // avoids no-op CR invocations on every deploy.
+          // Re-runs the CR when the migration FILES change or when the
+          // migration HANDLER itself changes — see hashMigrationInputs for why
+          // the second half matters (code migrations live in the bundle, not in
+          // a .sql folder, and hashing the folder alone left them inert).
           migrationHash,
         },
       });
@@ -1033,14 +1036,64 @@ exports.handler = async (event) => {
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Hashes the contents of the migrations folder (filenames + content) at synth
-// time. The result is fed into the migration Custom Resource so CFn re-invokes
-// the CR only when actual migration files change. Tool-agnostic — works for
-// Drizzle (.sql files in drizzle/), node-pg-migrate (.sql in migrations/),
-// Prisma (.sql in prisma/migrations/), or any tool that emits a stable folder
-// of versioned files. If the folder is missing or empty (very first build
-// before any migrations exist), we return a stable sentinel — the CR still
-// fires once on initial Create, then no-ops until migrations exist.
+// What decides whether the migration Custom Resource re-fires, hashed at synth
+// time from TWO inputs:
+//
+//   1. the migrations FOLDER (filenames + content) — Drizzle's `drizzle/*.sql`,
+//      node-pg-migrate's `migrations/`, Prisma's `prisma/migrations/`, …;
+//   2. the migration HANDLER's own compiled file — because a migration does not
+//      have to be a .sql file. A handler that runs code migrations (a list of
+//      one-shot functions gated by a sentinel row, a common pattern for
+//      key/value stores that have no SQL at all) ships its migrations INSIDE
+//      the bundle, and folder-only hashing never notices them.
+//
+// Before 0.5.4 only (1) was hashed. A project with no SQL folder therefore
+// produced the constant `no-migrations`, CloudFormation saw an unchanged
+// property on every subsequent deploy, and the Custom Resource fired exactly
+// ONCE — at stack creation. Its handler was faithfully redeployed forever after
+// and never invoked again: migrations shipped, believed applied, silently
+// inert. That failure is invisible precisely because nothing errors.
+//
+// Cost of the wider hash: at most one extra Lambda invocation per deploy, on
+// deploys that touch the backend bundle. A migration runner is expected to be
+// idempotent (Drizzle's is; the sentinel pattern is by construction), so a
+// no-op invocation is the intended cheap outcome. Nothing is replaced or
+// recreated — the CR gates the app Lambda's rollout, it does not rebuild it.
+export function hashMigrationInputs(opts: {
+  folder: string;
+  extensions: string[];
+  /** Compiled migration handler file, e.g. `<dist>/migrate.js`. Missing (a
+   *  handler that isn't a plain file in the bundle) → folder hash only. */
+  handlerFile?: string;
+}): string {
+  const folderHash = hashMigrationFolder(opts.folder, opts.extensions);
+  if (!opts.handlerFile || !fs.existsSync(opts.handlerFile)) return folderHash;
+  const h = crypto.createHash('sha256');
+  h.update(folderHash);
+  h.update(fs.readFileSync(opts.handlerFile));
+  return `${folderHash}-${h.digest('hex').slice(0, 16)}`;
+}
+
+/** `migrate.handler` → `<dist>/migrate.js` (or .mjs / .cjs). Returns undefined
+ *  when no such file exists, which keeps the pre-0.5.4 behaviour for any layout
+ *  this guess does not fit — a wrong guess must degrade to "folder only", never
+ *  to a wrong hash. */
+export function migrationHandlerFile(
+  distDir: string,
+  handler: string,
+): string | undefined {
+  const dot = handler.lastIndexOf('.');
+  if (dot <= 0) return undefined;
+  const base = path.join(distDir, handler.slice(0, dot));
+  for (const ext of ['.js', '.mjs', '.cjs']) {
+    if (fs.existsSync(base + ext)) return base + ext;
+  }
+  return undefined;
+}
+
+// Hashes the contents of the migrations folder (filenames + content). If the
+// folder is missing or empty (very first build before any migrations exist), we
+// return a stable sentinel.
 //
 // Recursive walk so nested layouts (Prisma's per-migration subfolders) work.
 function hashMigrationFolder(folder: string, extensions: string[]): string {
