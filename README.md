@@ -33,6 +33,10 @@ Single CDK stack that provisions a fullstack app's runtime + delivery on AWS:
 | `migrationHashExtensions` | no | `.sql` | Extensions counted when hashing that folder |
 | `migrationTimeoutSec` | no | `300` | Migration Lambda timeout |
 | `migrationMemoryMb` | no | `512` | Migration Lambda memory |
+| `scheduledWakeCron` | no | — | EventBridge expression (`cron(...)` / `rate(...)`). **Absent = the whole feature is off** |
+| `scheduledWakeHandler` | no | `scheduled.handler` | Handler export woken by the cron, inside the same backend bundle |
+| `scheduledWakeTimeoutSec` | no | `300` | Scheduled-wake Lambda timeout |
+| `scheduledWakeMemoryMb` | no | `512` | Scheduled-wake Lambda memory |
 
 ## Deploy-time migrations — when do they actually run?
 
@@ -65,6 +69,39 @@ Practical consequences:
   does not rebuild it.
 - Set `runMigrations=false` if your backend has no database at all.
 
+## Scheduled wake — doing something because TIME passed
+
+Some work isn't triggered by a request: a reminder before a deadline, a notice
+before a retention cut-off, any periodic sweep. Set `scheduledWakeCron` and the
+stack adds an EventBridge rule that invokes a **dedicated handler out of the
+same backend bundle** (default export `scheduled.handler`).
+
+```yaml
+# hereyaconfig/hereyavars/hereya-aws-app-lambda.yaml
+scheduledWakeCron: cron(0 * * * ? *)   # every hour, on the hour (UTC)
+```
+
+- **Entirely opt-in.** No `scheduledWakeCron` → no rule, no Lambda, no
+  permission, nothing added. An app that says nothing about schedules
+  synthesizes a byte-for-byte identical template to before this feature
+  existed.
+- **A separate function, not a cron on the app handler.** The app handler is an
+  HTTP adapter; feeding it an EventBridge event would make every app grow a
+  shape-sniffing branch at its front door, where getting it wrong breaks the
+  website rather than the cron. Your app learns "I was woken by the clock, not
+  by a request" from *which entry point ran*.
+- Same environment, secrets (`HEREYA_SECRETS_ARN`) and IAM as the app Lambda,
+  and it waits for deploy-time migrations exactly like the app does.
+- Retries twice, then stops (`maxEventAge` 30 min). The default EventBridge
+  policy — 185 retries over 24 h — would only pile duplicate work onto an app
+  already having a bad day.
+
+⚠️ **Your handler must be idempotent.** EventBridge delivers at least once and
+retries on failure, so a sweep that acts *per run* rather than *per due item*
+will eventually act twice — which, for anything that emails a customer or
+deletes data, is the way this feature does real harm. Mark each item done as
+you handle it, and make re-running a no-op.
+
 ## Outputs
 
 | Output | Description |
@@ -79,6 +116,7 @@ Practical consequences:
 | `dnsRecordCloudfrontApex{Name,Type,Value}` | CNAME (or ALIAS) record at apex → CloudFront |
 | `dnsRecordCloudfrontWww{Name,Type,Value}` | CNAME `www.${domain}` → CloudFront |
 | `dnsRecordsToAdd` | Aggregated JSON array of all records |
+| `scheduledWakeFunctionName` | Lambda invoked on the cron (only when `scheduledWakeCron` is set) |
 
 ## Two-deploy ACM flow (external DNS)
 

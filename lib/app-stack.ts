@@ -12,6 +12,8 @@ import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
 import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as events from 'aws-cdk-lib/aws-events';
+import * as targets from 'aws-cdk-lib/aws-events-targets';
 import { BucketDeployment, Source } from 'aws-cdk-lib/aws-s3-deployment';
 import * as cr from 'aws-cdk-lib/custom-resources';
 import * as crypto from 'crypto';
@@ -126,6 +128,32 @@ export class AppStack extends cdk.Stack {
     // Comma-separated list of file extensions counted when hashing the folder.
     // Default `.sql` covers most tools; set to `.sql,.js` etc. if your tool
     // emits other files that should also trigger re-runs.
+    // Scheduled wake — an EventBridge rule that invokes a DEDICATED handler
+    // from the same backend bundle on a cron. Entirely OPT-IN: no
+    // `scheduledWakeCron`, no rule, no Lambda, no permission, nothing added to
+    // the stack. An app that says nothing about schedules deploys exactly as
+    // it did before this feature existed.
+    //
+    // WHY A SEPARATE FUNCTION RATHER THAN A CRON ON THE APP HANDLER. The app
+    // handler is an HTTP adapter (API Gateway event in, HTTP response out);
+    // feeding it an EventBridge event means every app must grow a
+    // shape-sniffing branch at its front door, and getting that branch wrong
+    // breaks the website, not the cron. A second handler out of the same
+    // bundle keeps the two invocation kinds physically apart — the app learns
+    // "I was woken by the clock, not by a request" from WHICH ENTRY POINT ran,
+    // which is unambiguous — and it inherits the same env, secrets and IAM as
+    // the app through `configureFunction`. It is the exact shape the migration
+    // Lambda already has, for the same reasons.
+    const scheduledWakeCron = process.env['scheduledWakeCron']?.trim();
+    const scheduledWakeHandler =
+      process.env['scheduledWakeHandler'] ?? 'scheduled.handler';
+    const scheduledWakeTimeoutSec = process.env['scheduledWakeTimeoutSec']
+      ? parseInt(process.env['scheduledWakeTimeoutSec'])
+      : 300; // 5 min — a sweep reads rows and sends mail; it is not a request
+    const scheduledWakeMemoryMb = process.env['scheduledWakeMemoryMb']
+      ? parseInt(process.env['scheduledWakeMemoryMb'])
+      : 512;
+
     const migrationHashExtensions = (
       process.env['migrationHashExtensions'] ?? '.sql'
     )
@@ -292,6 +320,59 @@ export class AppStack extends cdk.Stack {
 
       // App Lambda must not see traffic until migrations complete.
       fn.node.addDependency(migrationResource);
+    }
+
+    // -----------------------------------------------------------------------
+    // 4b. Scheduled wake (opt-in) — EventBridge rule → dedicated handler
+    //
+    // For everything an app must do because TIME passed rather than because
+    // someone called it: reminders before a deadline, notice before a
+    // retention cut-off, any periodic sweep. Nothing here knows what the app
+    // will do with the wake — it only guarantees the app is woken.
+    //
+    // The handler MUST be idempotent. EventBridge guarantees at-least-once
+    // delivery, and a failed invocation is retried automatically, so a sweep
+    // that mails on every run rather than on every DUE ITEM will eventually
+    // mail twice. That is the single most likely way this feature hurts a
+    // customer, and it is the app's job to prevent — see the README.
+    // -----------------------------------------------------------------------
+
+    if (scheduledWakeCron) {
+      const scheduledFn = new lambda.Function(this, 'ScheduledWakeHandler', {
+        runtime: nodeRuntime,
+        handler: scheduledWakeHandler,
+        code: backendCode,
+        memorySize: scheduledWakeMemoryMb,
+        timeout: cdk.Duration.seconds(scheduledWakeTimeoutSec),
+        environment: plainEnv,
+      });
+      configureFunction(scheduledFn);
+      // Same ordering guarantee as the app Lambda: a sweep must never run
+      // against a schema the pending migrations have not reached yet.
+      if (migrationResource) scheduledFn.node.addDependency(migrationResource);
+
+      new events.Rule(this, 'ScheduledWakeRule', {
+        // `cron(...)` or `rate(...)` — passed through verbatim. Validating it
+        // here would mean re-implementing EventBridge's grammar and going
+        // stale; an invalid expression fails the deploy with EventBridge's own
+        // message, which is more useful than one we would invent.
+        schedule: events.Schedule.expression(scheduledWakeCron),
+        description: `Scheduled wake for ${this.stackName}`,
+        targets: [
+          new targets.LambdaFunction(scheduledFn, {
+            // Two attempts, then stop. A sweep is idempotent and runs again on
+            // the next tick, so the default 24-hour, 185-retry policy would
+            // only pile duplicate work onto an app already having a bad day.
+            retryAttempts: 2,
+            maxEventAge: cdk.Duration.minutes(30),
+          }),
+        ],
+      });
+
+      new CfnOutput(this, 'scheduledWakeFunctionName', {
+        value: scheduledFn.functionName,
+        description: 'Lambda invoked on the scheduled-wake cron',
+      });
     }
 
     // -----------------------------------------------------------------------
