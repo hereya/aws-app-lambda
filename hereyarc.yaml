@@ -1,6 +1,6 @@
 name: hereya/aws-app-lambda
-version: 0.5.5
-description: API Gateway + Lambda + CloudFront-fronted Astro frontend, single distribution with backend behaviors at /api/*, /mcp, /oauth/*, and /.well-known/* (for MCP authentication per the MCP auth spec). Two domain modes — external DNS (non-blocking ACM cert via custom resource, manual records) or auto-Route53 (single-deploy DnsValidatedCertificate + ALIAS records when defaultRootDomain is exposed by the workspace). Optional deploy-time migration Lambda gated by a CloudFormation Custom Resource.
+version: 0.5.6
+description: API Gateway + Lambda + CloudFront-fronted Astro frontend, single distribution with backend behaviors at /api/*, /mcp, /oauth/*, and /.well-known/* (for MCP authentication per the MCP auth spec). Two domain modes — external DNS (non-blocking ACM cert via custom resource, manual records) or auto-Route53 (single-deploy DnsValidatedCertificate + ALIAS records when defaultRootDomain is exposed by the workspace). Optional deploy-time migration Lambda gated by a CloudFormation Custom Resource. Optional opt-in CloudWatch alarms (Lambda Errors/Throttles, API Gateway 5xx, and a silence alarm on the scheduled handler) published to an SNS topic the consumer owns — absent alertTopicArn = no alarm created.
 iac: cdk
 infra: aws
 deploy: true

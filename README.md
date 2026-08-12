@@ -37,6 +37,8 @@ Single CDK stack that provisions a fullstack app's runtime + delivery on AWS:
 | `scheduledWakeHandler` | no | `scheduled.handler` | Handler export woken by the cron, inside the same backend bundle |
 | `scheduledWakeTimeoutSec` | no | `300` | Scheduled-wake Lambda timeout |
 | `scheduledWakeMemoryMb` | no | `512` | Scheduled-wake Lambda memory |
+| `alertTopicArn` | no | — | SNS topic the stack's alarms publish to. **Absent = no alarms at all** |
+| `scheduledWakeSilenceHours` | no | — | Alarm when the scheduled handler has not run once in N hours. **Absent = no silence alarm** |
 
 ## Deploy-time migrations — when do they actually run?
 
@@ -102,6 +104,49 @@ will eventually act twice — which, for anything that emails a customer or
 deletes data, is the way this feature does real harm. Mark each item done as
 you handle it, and make re-running a no-op.
 
+## Alarms — noticing a failure without reading a dashboard
+
+Set `alertTopicArn` and the stack alarms itself into an SNS topic you own. Set
+nothing and **no alarm is created**: an app that says nothing about alerting
+deploys exactly as it did before this feature existed, and pays nothing for it.
+That default is deliberate — CloudWatch bills per alarm, and quietly adding a
+handful to every consumer's next deploy is not this package's decision to make.
+
+**Why a topic ARN and not a notification channel.** Alarming and *notifying* are
+different jobs. This package knows what is worth watching in the stack it built;
+it knows nothing about who should be woken, in which language, or through which
+medium. You subscribe email, SMS, Chatbot or your own relay Lambda to the topic,
+and change your mind without redeploying the app. The topic may live in another
+stack — SNS's default topic policy already lets CloudWatch publish from the same
+account, so a cross-stack ARN needs no extra grant.
+
+| Alarm | Fires when | Sees what nothing else sees |
+|-------|-----------|------------------------------|
+| `HandlerErrors` / `HandlerThrottles` | ≥ 1 in 5 min | The app handler threw, or was throttled |
+| `ScheduledWakeErrors` / `ScheduledWakeThrottles` | ≥ 1 in 5 min | Same, for the cron handler (only with `scheduledWakeCron`) |
+| `HttpApi5xx` | ≥ 1 in 5 min | **A failure the Lambda metric structurally cannot see**: a 502 malformed response, a refused integration, a 504 integration timeout. None of those make the function throw, so `Errors` stays flat at zero while every visitor gets an error page |
+| `ScheduledWakeSilence` | no invocation in `scheduledWakeSilenceHours` | A cron handler that stopped being called *at all* — no error, no log line, no request. Nothing else in the stack mentions it |
+
+Thresholds are "≥ 1 in 5 minutes" because the expected floor is exactly zero;
+against a zero baseline that is the smallest signal that means something
+happened, not a noisy one. `4xx` is deliberately **not** alarmed — a public
+endpoint takes a constant drizzle of scanner traffic, and alarming it teaches
+its reader to ignore the topic, which is how an alerting layer dies. The
+migration Lambda is deliberately not alarmed either: a failed migration already
+fails and rolls back the deploy, in front of whoever is deploying.
+
+`scheduledWakeSilenceHours` has no default on purpose. This package accepts any
+cron expression, from every minute to once a month, so any silence window it
+picked for you would be wrong. Pick one that spans at least two ticks: a single
+missed tick is then absorbed, and only a dead clock alarms.
+
+⚠️ **Two notes for whoever subscribes to the topic.** Both states are published
+(ALARM *and* OK) — an alert that never says "it is over" trains its reader to
+ignore it. And a brand-new alarm is born `INSUFFICIENT_DATA`, then flips to `OK`
+as soon as it can judge: with an OK subscriber, the deploy that *creates* the
+alarms sends one message per alarm. Filter on `OldStateValue === "ALARM"` to
+announce a recovery only when something actually broke.
+
 ## Outputs
 
 | Output | Description |
@@ -117,6 +162,7 @@ you handle it, and make re-running a no-op.
 | `dnsRecordCloudfrontWww{Name,Type,Value}` | CNAME `www.${domain}` → CloudFront |
 | `dnsRecordsToAdd` | Aggregated JSON array of all records |
 | `scheduledWakeFunctionName` | Lambda invoked on the cron (only when `scheduledWakeCron` is set) |
+| `alertTopicArn` | Topic the alarms publish to (only when `alertTopicArn` is set) |
 
 ## Two-deploy ACM flow (external DNS)
 

@@ -12,6 +12,9 @@ import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
 import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as sns from 'aws-cdk-lib/aws-sns';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as cwActions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import { BucketDeployment, Source } from 'aws-cdk-lib/aws-s3-deployment';
@@ -154,6 +157,43 @@ export class AppStack extends cdk.Stack {
       ? parseInt(process.env['scheduledWakeMemoryMb'])
       : 512;
 
+    // Alarms — OPT-IN, and the switch is the SNS topic you hand in.
+    //
+    // No `alertTopicArn`, no alarms: an app that says nothing about alerting
+    // deploys exactly as it did before this feature existed, and pays nothing.
+    // That is deliberate for a package this many projects share — CloudWatch
+    // alarms are billed per alarm, and silently adding a handful to every
+    // consumer's next deploy is not a decision this package gets to make.
+    //
+    // WHY A TOPIC ARN RATHER THAN A NOTIFICATION CHANNEL. Alarming and
+    // NOTIFYING are different jobs. This package knows what is worth watching
+    // in the stack it built; it knows nothing about who should be woken, in
+    // which language, or through which medium. Handing it a topic keeps that
+    // second half where it belongs — the consumer subscribes email, SMS, Chatbot
+    // or its own relay Lambda, and can change its mind without redeploying the
+    // app. The topic may live in ANOTHER stack: SNS's default topic policy
+    // already lets CloudWatch publish from the same account, so a cross-stack
+    // ARN needs no extra grant.
+    //
+    // Both directions are wired (ALARM and OK). An alert that never says "it is
+    // over" trains its reader to ignore it. Note for subscribers: a brand-new
+    // alarm is born INSUFFICIENT_DATA and flips to OK as soon as it can judge,
+    // so the first deploy sends one OK per alarm unless the subscriber filters
+    // on `OldStateValue === 'ALARM'`.
+    const alertTopicArn = process.env['alertTopicArn']?.trim();
+
+    // The one alarm that cannot be inferred: silence. A scheduled handler that
+    // stops being invoked emits NO datapoint at all (not a zero), and no other
+    // instrument in this stack mentions it — no request touches it, so it is
+    // absent from every log and every error metric. Detecting that means
+    // declaring how long silence is allowed to last, and only the app knows:
+    // this package accepts any cron expression, from every minute to once a
+    // month, so any window it picked for you would be wrong. Absent = no
+    // silence alarm (the other alarms are unaffected).
+    const scheduledWakeSilenceHours = process.env['scheduledWakeSilenceHours']
+      ? parseInt(process.env['scheduledWakeSilenceHours'])
+      : undefined;
+
     const migrationHashExtensions = (
       process.env['migrationHashExtensions'] ?? '.sql'
     )
@@ -264,6 +304,14 @@ export class AppStack extends cdk.Stack {
     });
     configureFunction(fn);
 
+    // Every function that gets an Errors/Throttles alarm in section 10b.
+    // Collected as they are built because the scheduled one is created inside a
+    // feature-conditional block and would otherwise be out of scope there.
+    const monitoredFunctions: { label: string; fn: lambda.Function }[] = [
+      { label: 'Handler', fn },
+    ];
+    let scheduledFn: lambda.Function | undefined;
+
     // -----------------------------------------------------------------------
     // 4a. Migration Lambda + Custom Resource (deploy-time migrations)
     //
@@ -338,7 +386,7 @@ export class AppStack extends cdk.Stack {
     // -----------------------------------------------------------------------
 
     if (scheduledWakeCron) {
-      const scheduledFn = new lambda.Function(this, 'ScheduledWakeHandler', {
+      scheduledFn = new lambda.Function(this, 'ScheduledWakeHandler', {
         runtime: nodeRuntime,
         handler: scheduledWakeHandler,
         code: backendCode,
@@ -347,6 +395,7 @@ export class AppStack extends cdk.Stack {
         environment: plainEnv,
       });
       configureFunction(scheduledFn);
+      monitoredFunctions.push({ label: 'ScheduledWake', fn: scheduledFn });
       // Same ordering guarantee as the app Lambda: a sweep must never run
       // against a schema the pending migrations have not reached yet.
       if (migrationResource) scheduledFn.node.addDependency(migrationResource);
@@ -980,6 +1029,121 @@ exports.handler = async (event) => {
       distribution,
       distributionPaths: ['/*'],
     });
+
+    // -----------------------------------------------------------------------
+    // 10b. Alarms (opt-in — see `alertTopicArn` in section 1)
+    //
+    // Three instruments, each blind to what the others see. That is the point:
+    // every gap this package has had was found by ADDING an instrument, never
+    // by reading an existing one more carefully.
+    //
+    //   - `AWS/Lambda Errors` sees a handler that throws, and nothing else.
+    //   - `AWS/ApiGateway 5xx` sees what Lambda Errors structurally CANNOT: a
+    //     502 malformed response, a refused integration, a 504 integration
+    //     timeout. None of those make the function throw, so the Lambda metric
+    //     stays flat at zero while every visitor gets an error page.
+    //   - the silence alarm sees a scheduled handler that stopped being called
+    //     at all — a failure with no error, no log line and no request.
+    //
+    // Thresholds are 1-in-5-minutes because the expected floor is exactly zero:
+    // against an empirically zero baseline, "at least one" is the smallest
+    // signal that means something happened, not a noisy one. `4xx` is
+    // deliberately NOT alarmed — public endpoints take a constant drizzle of
+    // scanner traffic, and alarming it teaches its reader to ignore the topic.
+    //
+    // The migration Lambda is deliberately absent: a failed migration already
+    // fails and rolls back the deploy, in front of whoever is deploying.
+    // -----------------------------------------------------------------------
+
+    if (alertTopicArn) {
+      const alertTopic = sns.Topic.fromTopicArn(
+        this,
+        'AlertTopic',
+        alertTopicArn,
+      );
+      const alertAction = new cwActions.SnsAction(alertTopic);
+      const alertOn = (alarm: cloudwatch.Alarm): void => {
+        alarm.addAlarmAction(alertAction);
+        alarm.addOkAction(alertAction);
+      };
+
+      for (const { label, fn: monitored } of monitoredFunctions) {
+        for (const [metricName, metric] of [
+          ['Errors', monitored.metricErrors()],
+          ['Throttles', monitored.metricThrottles()],
+        ] as const) {
+          alertOn(
+            new cloudwatch.Alarm(this, `${label}${metricName}Alarm`, {
+              metric: metric.with({
+                period: cdk.Duration.minutes(5),
+                statistic: 'Sum',
+              }),
+              threshold: 1,
+              evaluationPeriods: 1,
+              comparisonOperator:
+                cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+              // A function nobody called reports no datapoint; that is silence,
+              // not failure. BREACHING here would fire on every quiet night.
+              treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+              alarmDescription:
+                `${domain} — ${label} Lambda ${metricName} >= 1 in 5 min ` +
+                `(expected floor is 0). Stack ${this.stackName}.`,
+            }),
+          );
+        }
+      }
+
+      alertOn(
+        new cloudwatch.Alarm(this, 'HttpApi5xxAlarm', {
+          metric: new cloudwatch.Metric({
+            namespace: 'AWS/ApiGateway',
+            metricName: '5xx',
+            dimensionsMap: { ApiId: httpApi.apiId },
+            period: cdk.Duration.minutes(5),
+            statistic: 'Sum',
+          }),
+          threshold: 1,
+          evaluationPeriods: 1,
+          comparisonOperator:
+            cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+          treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+          alarmDescription:
+            `${domain} — API Gateway 5xx >= 1 in 5 min. The Lambda error ` +
+            `metric cannot see this class of failure: a 502/504 means the ` +
+            `response was malformed or the integration never answered, and ` +
+            `neither makes the function throw. Stack ${this.stackName}.`,
+        }),
+      );
+
+      if (scheduledFn && scheduledWakeSilenceHours) {
+        alertOn(
+          new cloudwatch.Alarm(this, 'ScheduledWakeSilenceAlarm', {
+            metric: scheduledFn.metricInvocations({
+              period: cdk.Duration.hours(scheduledWakeSilenceHours),
+              statistic: 'Sum',
+            }),
+            threshold: 1,
+            evaluationPeriods: 1,
+            comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+            // Absence IS the signal here, so missing data must breach — the
+            // inverse of every other alarm above. A handler that is never
+            // invoked publishes nothing at all, so NOT_BREACHING would make
+            // this alarm blind to the exact thing it exists to catch.
+            treatMissingData: cloudwatch.TreatMissingData.BREACHING,
+            alarmDescription:
+              `${domain} — the scheduled handler has not run once in ` +
+              `${scheduledWakeSilenceHours}h (cron ${scheduledWakeCron}). ` +
+              `Whatever it does because time passed — reminders, sweeps, ` +
+              `renewals — has stopped, silently. Stack ${this.stackName}.`,
+          }),
+        );
+      }
+
+      new CfnOutput(this, 'alertTopicArn', {
+        value: alertTopicArn,
+        description: 'SNS topic this stack publishes its alarm states to',
+      });
+    }
 
     // -----------------------------------------------------------------------
     // 11. CfnOutputs
