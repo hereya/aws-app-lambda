@@ -39,6 +39,7 @@ Single CDK stack that provisions a fullstack app's runtime + delivery on AWS:
 | `scheduledWakeMemoryMb` | no | `512` | Scheduled-wake Lambda memory |
 | `alertTopicArn` | no | — | SNS topic the stack's alarms publish to. **Absent = no alarms at all** |
 | `scheduledWakeSilenceHours` | no | — | Alarm when the scheduled handler has not run once in N hours. **Absent = no silence alarm** |
+| `logAlarms` | no | — | JSON array of log lines that must never appear; each becomes a metric filter + alarm. **Absent = none** (requires `alertTopicArn`) |
 
 ## Deploy-time migrations — when do they actually run?
 
@@ -134,6 +135,56 @@ endpoint takes a constant drizzle of scanner traffic, and alarming it teaches
 its reader to ignore the topic, which is how an alerting layer dies. The
 migration Lambda is deliberately not alarmed either: a failed migration already
 fails and rolls back the deploy, in front of whoever is deploying.
+
+### `logAlarms` — the failure that succeeds
+
+The four alarms above all count **failures**. None of them can see a component
+that fails *cleanly*: a request refused on purpose is a 4xx, an integration that
+answers "no" is a 200, and a handler that catches its own error and writes a
+line about it never throws. `Lambda Errors` reads 0, `ApiGateway 5xx` reads 0,
+and the only witness is a sentence in a log nobody reads at 3am.
+
+Measured, not theorised (dilaya.eu, 2026-08-27): 210 Stripe webhooks refused for
+a bad signature over three hours, every instrument in this stack flat at zero
+throughout, because each refusal was the design working. It surfaced only in a
+twice-daily manual sweep.
+
+So name the lines that must never appear:
+
+```yaml
+logAlarms: |
+  [{"id": "StripeWebhookRejectedLive",
+    "pattern": "\"[stripe-webhook] REJECTED live=true\"",
+    "description": "A LIVE Stripe webhook was refused for a bad signature — the vaulted signing secret no longer matches the endpoint, and real billing events are being dropped."}]
+```
+
+| Field | Required | Default | Meaning |
+|-------|----------|---------|---------|
+| `id` | yes | — | 3–64 alphanumerics, starts with a letter. Becomes the CloudWatch metric name (namespace `Hereya/AppLogs`, dimension `Stack`) and part of the construct id |
+| `pattern` | yes | — | A CloudWatch **filter pattern**, passed through verbatim. The quoting is CloudWatch's own — a quoted term is an exact substring match |
+| `description` | yes | — | One sentence saying what it means when this fires. It *is* the alert text |
+| `threshold` | no | `1` | Matching lines per period before it fires |
+| `periodMinutes` | no | `5` | The period, 1–1440 |
+
+The filters attach to the **app handler's** log group. Every malformed entry
+**throws at synth**, deliberately: this feature exists to stop things failing
+quietly, so a typo that produced a green deploy and an alarm that was never
+created would reproduce that exact failure one level up. A list without
+`alertTopicArn` throws for the same reason.
+
+Prove a pattern before you ship it — read-only, no resources touched:
+
+```sh
+aws logs test-metric-filter \
+  --filter-pattern '"[stripe-webhook] REJECTED live=true"' \
+  --log-event-messages 'WARN [stripe-webhook] REJECTED live=true evt=evt_1 …' \
+                       'WARN [stripe-webhook] REJECTED live=false evt=evt_2 …'
+```
+
+⚠️ **The pattern is a contract with the code that writes the line.** Reword the
+log line and the filter silently stops matching — and a filter that matches
+nothing looks exactly like a system with nothing to report. Say so at the place
+the line is written.
 
 `scheduledWakeSilenceHours` has no default on purpose. This package accepts any
 cron expression, from every minute to once a month, so any silence window it
