@@ -14,6 +14,7 @@ import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as logs from 'aws-cdk-lib/aws-logs';
 import * as cwActions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
@@ -192,6 +193,36 @@ export class AppStack extends cdk.Stack {
     // silence alarm (the other alarms are unaffected).
     const scheduledWakeSilenceHours = process.env['scheduledWakeSilenceHours']
       ? parseInt(process.env['scheduledWakeSilenceHours'])
+      : undefined;
+
+    // Gateway ACCESS LOG — OPT-IN, and the switch is the retention you ask for.
+    //
+    // Same doctrine as `alertTopicArn` above: absent = no log group, no access
+    // log, no per-route metrics, and a consumer that says nothing deploys and
+    // pays exactly as before. A log group on every consumer's gateway is not a
+    // decision this package gets to make — the bytes are billed to them.
+    //
+    // WHY IT IS WORTH ASKING FOR. `AWS/Lambda Errors` counts only invocations
+    // that THREW. A handler that catches its own exception and returns a 500 —
+    // which is what every framework does by default — leaves that metric at
+    // zero. And a request that fails at the GATEWAY (502 malformed response,
+    // 504 integration timeout, an authorizer refusal) never reaches the handler
+    // at all, so it appears in no application log either. Between those two
+    // facts, a whole class of failure is invisible unless the gateway itself is
+    // asked to write down what it did.
+    //
+    // Measured, not theorised (dilaya.eu, 2026-08-26): ten gateway 5xx over one
+    // evening while `AWS/Lambda Errors` read 0 for the full 24 h. They were
+    // attributable only because the handler happened to log the exception
+    // itself; a 502 or a 504 would have left nothing to attribute.
+    //
+    // WHY A RETENTION RATHER THAN A BOOLEAN: the number is not optional
+    // information — an access log with no retention set keeps every line for
+    // ever and quietly becomes the largest line on the bill. Making the value
+    // the switch means the question is answered exactly once, by the consumer,
+    // and cannot be forgotten.
+    const accessLogRetentionDays = process.env['accessLogRetentionDays']
+      ? parseInt(process.env['accessLogRetentionDays'])
       : undefined;
 
     const migrationHashExtensions = (
@@ -447,6 +478,59 @@ export class AppStack extends cdk.Stack {
       methods: [apigwv2.HttpMethod.ANY],
       integration: lambdaIntegration,
     });
+
+    // Access log + per-route metrics on the `$default` stage (opt-in — see
+    // `accessLogRetentionDays` in section 1).
+    if (accessLogRetentionDays !== undefined) {
+      const accessLogGroup = new logs.LogGroup(this, 'HttpApiAccessLogs', {
+        retention: retentionFromDays(accessLogRetentionDays),
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      });
+
+      // The settings live only on the L1 stage: `HttpApi` exposes no prop for
+      // them, and `defaultStage` is the one `createDefaultStage` made for us.
+      const cfnDefaultStage = httpApi.defaultStage!.node
+        .defaultChild as apigwv2.CfnStage;
+      cfnDefaultStage.accessLogSettings = {
+        destinationArn: accessLogGroup.logGroupArn,
+        // One JSON object per request, ordered by what a reader actually needs:
+        // the status first, then WHY (a 5xx with `integrationStatus` absent is
+        // a gateway fault; the same status with `integrationStatus: 200` is the
+        // handler's own chosen response — a different bug entirely), then WHO
+        // (ip/ua, which separates a scanner from one of your own components).
+        format: JSON.stringify({
+          requestId: '$context.requestId',
+          requestTime: '$context.requestTime',
+          httpMethod: '$context.httpMethod',
+          routeKey: '$context.routeKey',
+          path: '$context.path',
+          status: '$context.status',
+          integrationStatus: '$context.integrationStatus',
+          integrationErrorMessage: '$context.integrationErrorMessage',
+          integrationLatency: '$context.integrationLatency',
+          responseLatency: '$context.responseLatency',
+          errorMessage: '$context.error.message',
+          authorizerError: '$context.authorizer.error',
+          sourceIp: '$context.identity.sourceIp',
+          userAgent: '$context.identity.userAgent',
+        }),
+      };
+
+      // Per-route `5xx`/`4xx`/`Count`/`Latency`. Without this the 5xx metric
+      // exists only at the API level — you learn that something failed, never
+      // which route, which is the difference between a finding and a rumour.
+      cfnDefaultStage.defaultRouteSettings = {
+        ...(cfnDefaultStage.defaultRouteSettings as
+          | apigwv2.CfnStage.RouteSettingsProperty
+          | undefined),
+        detailedMetricsEnabled: true,
+      };
+
+      new CfnOutput(this, 'httpApiAccessLogGroup', {
+        value: accessLogGroup.logGroupName,
+        description: 'CloudWatch log group receiving the HTTP API access log',
+      });
+    }
 
     // -----------------------------------------------------------------------
     // 6. ACM cert
@@ -1442,6 +1526,28 @@ function readTaggedCertStatus(opts: {
   }
 
   return 'NOT_FOUND';
+}
+
+/**
+ * `accessLogRetentionDays` → a CloudWatch `RetentionDays`.
+ *
+ * CloudWatch accepts only a fixed set of retention values, and the enum's
+ * members ARE those day counts — so a plain cast would compile happily and be
+ * refused by CloudFormation halfway through a deploy, with a message that names
+ * neither this parameter nor the value that caused it. Validating here turns
+ * that into a synth-time error naming both.
+ */
+function retentionFromDays(days: number): logs.RetentionDays {
+  const allowed = Object.values(logs.RetentionDays).filter(
+    (v): v is number => typeof v === 'number',
+  );
+  if (!allowed.includes(days)) {
+    throw new Error(
+      `accessLogRetentionDays=${days} is not a retention CloudWatch accepts. ` +
+        `Pick one of: ${allowed.sort((a, b) => a - b).join(', ')}.`,
+    );
+  }
+  return days as logs.RetentionDays;
 }
 
 function resolveNodeRuntime(input: string | undefined): lambda.Runtime {
