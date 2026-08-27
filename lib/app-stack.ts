@@ -1281,11 +1281,35 @@ exports.handler = async (event) => {
         const filter = new logs.MetricFilter(this, `${entry.id}MetricFilter`, {
           logGroup: fn.logGroup,
           filterPattern: logs.FilterPattern.literal(entry.pattern),
-          metricNamespace: LOG_ALARM_NAMESPACE,
+          // SEPARATED BY NAMESPACE, NOT BY DIMENSION — and that is not a
+          // stylistic choice. Two facts about CloudWatch Logs, neither of
+          // which CDK checks at synth (both measured against the real API on
+          // 2026-08-27, the second one the hard way, on a production deploy
+          // that failed and rolled back):
+          //
+          //   1. `dimensions` and `defaultValue` are mutually exclusive on a
+          //      metric transformation — the service answers 400.
+          //   2. `dimensions` require a filter pattern that EXTRACTS named
+          //      fields (JSON or space-delimited). A plain substring pattern,
+          //      which is what "this line must never appear" always is, gets
+          //      "The specified filter pattern does not support dimensions".
+          //
+          // So a substring filter cannot be dimensioned at all, and the stack
+          // has to be part of the NAMESPACE instead. Separation still matters
+          // for the same reason it always did: the metric name comes from the
+          // consumer, so two apps picking the same id would otherwise add
+          // their counts together and each alarm would fire on the other's
+          // events.
+          //
+          // ⚠️ A GREEN `cdk synth` IS NOT A VALIDATION OF THE API CONTRACT.
+          // Both shapes above synthesise perfectly.
+          metricNamespace: `${LOG_ALARM_NAMESPACE}/${this.stackName}`,
           metricName: entry.id,
-          // Dimensioned by stack, so two consumers of this package do not add
-          // their counts together under one metric name.
-          dimensions: { Stack: this.stackName },
+          // Now that dimensions are gone, this is allowed — and it earns its
+          // place: the filter publishes an explicit 0 for every period with no
+          // match, so the alarm has a continuous series to judge instead of a
+          // sparse one. A sparse metric takes three periods to be called
+          // healthy again after a firing; a dense one recovers in one.
           metricValue: '1',
           defaultValue: 0,
         });
@@ -1295,7 +1319,6 @@ exports.handler = async (event) => {
             metric: filter.metric({
               period: cdk.Duration.minutes(entry.periodMinutes),
               statistic: 'Sum',
-              dimensionsMap: { Stack: this.stackName },
             }),
             threshold: entry.threshold,
             evaluationPeriods: 1,
@@ -1617,11 +1640,14 @@ function readTaggedCertStatus(opts: {
 }
 
 /**
- * The metric namespace every `logAlarms` entry publishes under.
+ * Namespace PREFIX every `logAlarms` entry publishes under; the stack name is
+ * appended, giving `Hereya/AppLogs/<stackName>`.
  *
- * One namespace for the whole package rather than one per consumer: a reader
- * looking for "which of my apps is writing a line it shouldn't" wants a single
- * place to look. The `Stack` dimension keeps the counts apart.
+ * The shared prefix keeps "which of my apps is writing a line it shouldn't" a
+ * single place to look in the CloudWatch namespace list, while the stack
+ * suffix keeps two consumers that chose the same metric id from adding their
+ * counts together. Dimensions would have been the natural way to say this and
+ * are not available here — see the comment at the MetricFilter.
  */
 const LOG_ALARM_NAMESPACE = 'Hereya/AppLogs';
 

@@ -160,7 +160,7 @@ logAlarms: |
 
 | Field | Required | Default | Meaning |
 |-------|----------|---------|---------|
-| `id` | yes | — | 3–64 alphanumerics, starts with a letter. Becomes the CloudWatch metric name (namespace `Hereya/AppLogs`, dimension `Stack`) and part of the construct id |
+| `id` | yes | — | 3–64 alphanumerics, starts with a letter. Becomes the CloudWatch metric name, under namespace `Hereya/AppLogs/<stackName>`, and part of the construct id |
 | `pattern` | yes | — | A CloudWatch **filter pattern**, passed through verbatim. The quoting is CloudWatch's own — a quoted term is an exact substring match |
 | `description` | yes | — | One sentence saying what it means when this fires. It *is* the alert text |
 | `threshold` | no | `1` | Matching lines per period before it fires |
@@ -180,6 +180,16 @@ aws logs test-metric-filter \
   --log-event-messages 'WARN [stripe-webhook] REJECTED live=true evt=evt_1 …' \
                        'WARN [stripe-webhook] REJECTED live=false evt=evt_2 …'
 ```
+
+⚠️ **A green `cdk synth` is not a validation of the API contract.** Two rules
+CloudWatch Logs enforces and CDK does not check, both learned against the real
+API (the second one on a production deploy that failed and rolled back): a
+metric transformation may not carry `dimensions` *and* `defaultValue`, and
+`dimensions` require a filter pattern that EXTRACTS named fields — which a
+"this line must never appear" substring pattern never does. That is why the
+stack name lives in the **namespace** here rather than in a dimension. Prove a
+new shape with `aws logs put-metric-filter` against a throwaway log group before
+you ship it.
 
 ⚠️ **The pattern is a contract with the code that writes the line.** Reword the
 log line and the filter silently stops matching — and a filter that matches
