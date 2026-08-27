@@ -225,6 +225,53 @@ export class AppStack extends cdk.Stack {
       ? parseInt(process.env['accessLogRetentionDays'])
       : undefined;
 
+    // LOG ALARMS — OPT-IN, and the switch is the list itself.
+    //
+    // The gap this closes is the one none of the three alarms above can see: a
+    // component that FAILS CLEANLY. A request refused on purpose is a 4xx, an
+    // integration that answers "no" is a 200, and a handler that catches its
+    // own error and writes a line about it never throws — so `Lambda Errors`
+    // reads 0, `ApiGateway 5xx` reads 0, and the only witness is a sentence in
+    // a log that nobody is watching at 3am.
+    //
+    // Measured, not theorised (dilaya.eu, 2026-08-27): 210 Stripe webhooks
+    // refused for a bad signature over three hours. Every instrument in this
+    // stack read zero throughout, because every one of them counts FAILURES
+    // and this was a refusal working exactly as designed. It surfaced only in
+    // a twice-daily manual sweep — and, read without enough detail in the line
+    // itself, it surfaced as the WRONG incident.
+    //
+    // So: the consumer names the lines that must never appear, and each one
+    // becomes a metric filter on the app handler's log group plus an alarm on
+    // the same SNS topic as everything else. This package cannot know which
+    // lines those are; it can only make it possible to say.
+    //
+    // Shape — a JSON array, because a YAML var is a string:
+    //
+    //   logAlarms: |
+    //     [{"id":"StripeWebhookRejectedLive",
+    //       "pattern":"\"[stripe-webhook] REJECTED live=true\"",
+    //       "description":"A LIVE Stripe webhook was refused …"}]
+    //
+    // `pattern` is a CloudWatch FILTER PATTERN, passed through verbatim — the
+    // quoting is CloudWatch's, not ours, and a package that tried to be clever
+    // about it would silently change what matches. `threshold` (default 1) and
+    // `periodMinutes` (default 5) are optional; the defaults say "once is
+    // once too often", which is the only sensible floor for a line that must
+    // never appear.
+    const logAlarms = parseLogAlarms(process.env['logAlarms']);
+
+    // A list with nowhere to publish is the failure this package must never
+    // ship: CloudFormation would succeed, the metric filters would exist, and
+    // nothing would ever fire. Loud at synth beats silent in production.
+    if (logAlarms.length > 0 && !alertTopicArn) {
+      throw new Error(
+        `logAlarms lists ${logAlarms.length} alarm(s) but alertTopicArn is ` +
+          `not set, so none of them could notify anyone. Set alertTopicArn, ` +
+          `or remove logAlarms.`,
+      );
+    }
+
     const migrationHashExtensions = (
       process.env['migrationHashExtensions'] ?? '.sql'
     )
@@ -1223,6 +1270,47 @@ exports.handler = async (event) => {
         );
       }
 
+      // Log-line alarms (see `logAlarms` in section 1). One metric filter per
+      // entry on the app handler's log group, and one alarm on the metric it
+      // publishes.
+      //
+      // `treatMissingData: NOT_BREACHING` — a filter that matches nothing
+      // publishes no datapoint at all, and "the bad line did not appear" is
+      // the healthy state, not an absence of information.
+      for (const entry of logAlarms) {
+        const filter = new logs.MetricFilter(this, `${entry.id}MetricFilter`, {
+          logGroup: fn.logGroup,
+          filterPattern: logs.FilterPattern.literal(entry.pattern),
+          metricNamespace: LOG_ALARM_NAMESPACE,
+          metricName: entry.id,
+          // Dimensioned by stack, so two consumers of this package do not add
+          // their counts together under one metric name.
+          dimensions: { Stack: this.stackName },
+          metricValue: '1',
+          defaultValue: 0,
+        });
+
+        alertOn(
+          new cloudwatch.Alarm(this, `${entry.id}LogAlarm`, {
+            metric: filter.metric({
+              period: cdk.Duration.minutes(entry.periodMinutes),
+              statistic: 'Sum',
+              dimensionsMap: { Stack: this.stackName },
+            }),
+            threshold: entry.threshold,
+            evaluationPeriods: 1,
+            comparisonOperator:
+              cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+            treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+            alarmDescription:
+              `${domain} — ${entry.description} ` +
+              `(>= ${entry.threshold} matching log line(s) in ` +
+              `${entry.periodMinutes} min; pattern ${entry.pattern}). ` +
+              `Stack ${this.stackName}.`,
+          }),
+        );
+      }
+
       new CfnOutput(this, 'alertTopicArn', {
         value: alertTopicArn,
         description: 'SNS topic this stack publishes its alarm states to',
@@ -1526,6 +1614,127 @@ function readTaggedCertStatus(opts: {
   }
 
   return 'NOT_FOUND';
+}
+
+/**
+ * The metric namespace every `logAlarms` entry publishes under.
+ *
+ * One namespace for the whole package rather than one per consumer: a reader
+ * looking for "which of my apps is writing a line it shouldn't" wants a single
+ * place to look. The `Stack` dimension keeps the counts apart.
+ */
+const LOG_ALARM_NAMESPACE = 'Hereya/AppLogs';
+
+interface LogAlarmSpec {
+  id: string;
+  pattern: string;
+  description: string;
+  threshold: number;
+  periodMinutes: number;
+}
+
+/**
+ * `logAlarms` (a JSON array in a YAML var) → validated specs.
+ *
+ * EVERY failure here THROWS, and that is the whole design. The failure mode
+ * this feature exists to prevent is a component that fails quietly; shipping
+ * it with a parser that skips a malformed entry would reproduce that failure
+ * one level up — a green deploy, an alarm that was never created, and a
+ * consumer who believes they are being watched. A typo must stop the deploy.
+ *
+ * `id` is doubly load-bearing: it is the CloudWatch metric name AND part of
+ * the CDK construct id, so it is held to the alphanumeric shape both accept.
+ */
+function parseLogAlarms(raw: string | undefined): LogAlarmSpec[] {
+  const trimmed = raw?.trim();
+  if (!trimmed) return [];
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (err) {
+    throw new Error(
+      `logAlarms is not valid JSON: ${err instanceof Error ? err.message : err}. ` +
+        `Expected an array like [{"id":"…","pattern":"…","description":"…"}].`,
+    );
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(`logAlarms must be a JSON ARRAY, got ${typeof parsed}.`);
+  }
+
+  const seen = new Set<string>();
+  return parsed.map((entry, i) => {
+    const where = `logAlarms[${i}]`;
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error(`${where} must be an object.`);
+    }
+    const { id, pattern, description, threshold, periodMinutes } =
+      entry as Record<string, unknown>;
+
+    if (typeof id !== 'string' || !/^[A-Za-z][A-Za-z0-9]{2,63}$/.test(id)) {
+      throw new Error(
+        `${where}.id must be 3-64 alphanumeric characters starting with a ` +
+          `letter (it becomes a CloudWatch metric name and a CDK construct ` +
+          `id); got ${JSON.stringify(id)}.`,
+      );
+    }
+    if (seen.has(id)) {
+      throw new Error(
+        `${where}.id "${id}" is used twice — two alarms would collide on one ` +
+          `metric and one construct id.`,
+      );
+    }
+    seen.add(id);
+
+    if (typeof pattern !== 'string' || pattern.trim() === '') {
+      throw new Error(
+        `${where}.pattern must be a non-empty CloudWatch filter pattern. An ` +
+          `empty pattern matches EVERY line, which would alarm on the first ` +
+          `request.`,
+      );
+    }
+    // A description is not decoration: it is the entire message the person
+    // woken at 3am receives. An alarm that only quotes its own filter pattern
+    // tells them what matched, never why they should care.
+    if (typeof description !== 'string' || description.trim().length < 10) {
+      throw new Error(
+        `${where}.description must say, in a sentence, what it means when ` +
+          `this fires — it is what the alert says out loud.`,
+      );
+    }
+
+    const resolvedThreshold = threshold === undefined ? 1 : threshold;
+    if (
+      typeof resolvedThreshold !== 'number' ||
+      !Number.isInteger(resolvedThreshold) ||
+      resolvedThreshold < 1
+    ) {
+      throw new Error(
+        `${where}.threshold must be an integer >= 1; got ${JSON.stringify(threshold)}.`,
+      );
+    }
+
+    const resolvedPeriod = periodMinutes === undefined ? 5 : periodMinutes;
+    if (
+      typeof resolvedPeriod !== 'number' ||
+      !Number.isInteger(resolvedPeriod) ||
+      resolvedPeriod < 1 ||
+      resolvedPeriod > 1440
+    ) {
+      throw new Error(
+        `${where}.periodMinutes must be an integer between 1 and 1440; got ` +
+          `${JSON.stringify(periodMinutes)}.`,
+      );
+    }
+
+    return {
+      id,
+      pattern: pattern.trim(),
+      description: description.trim(),
+      threshold: resolvedThreshold,
+      periodMinutes: resolvedPeriod,
+    };
+  });
 }
 
 /**
