@@ -36,9 +36,14 @@ Single CDK stack that provisions a fullstack app's runtime + delivery on AWS:
 | `scheduledWakeCron` | no | — | EventBridge expression (`cron(...)` / `rate(...)`). **Absent = the whole feature is off** |
 | `scheduledWakeHandler` | no | `scheduled.handler` | Handler export woken by the cron, inside the same backend bundle |
 | `scheduledWakeTimeoutSec` | no | `300` | Scheduled-wake Lambda timeout |
-| `scheduledWakeMemoryMb` | no | `512` | Scheduled-wake Lambda memory |
+| `scheduledWakeMemoryMb` | no | `512` | Worker Lambda memory (cron and/or queue) |
+| `workerQueue` | no | — | `true` adds an SQS queue + DLQ whose messages invoke the same worker handler. **Absent = no queue** |
+| `workerQueueVisibilityTimeoutSec` | no | `scheduledWakeTimeoutSec + 60` | Recovery delay: how long before a message is handed to another worker. Must exceed the function timeout |
+| `workerQueueMaxReceiveCount` | no | `4` | Deliveries before a message goes to the dead-letter queue |
+| `workerQueueBatchSize` | no | `1` | Messages per invocation |
+| `workerQueueMaxConcurrency` | no | `2` | Ceiling on workers running at once (minimum 2) |
 | `alertTopicArn` | no | — | SNS topic the stack's alarms publish to. **Absent = no alarms at all** |
-| `scheduledWakeSilenceHours` | no | — | Alarm when the scheduled handler has not run once in N hours. **Absent = no silence alarm** |
+| `scheduledWakeSilenceHours` | no | — | Alarm when the **cron** handler has not run once in N hours. **Absent = no silence alarm** |
 | `logAlarms` | no | — | JSON array of log lines that must never appear; each becomes a metric filter + alarm. **Absent = none** (requires `alertTopicArn`) |
 
 ## Deploy-time migrations — when do they actually run?
@@ -105,6 +110,60 @@ will eventually act twice — which, for anything that emails a customer or
 deletes data, is the way this feature does real harm. Mark each item done as
 you handle it, and make re-running a no-op.
 
+## Work queue — doing something the request had no time for
+
+Some work belongs off the request path entirely: a transfer that takes minutes,
+a report to build, anything whose duration is set on the other side of a wire
+you do not control. API Gateway caps a request at 30 s, and no amount of tuning
+inside it reaches a number someone else sets.
+
+Set `workerQueue: "true"` and the stack adds an SQS queue, a dead-letter queue
+behind it, and an event source that invokes the **same worker handler** the
+cron would have (default `scheduled.handler`). The app handler is granted
+`SendMessage` and receives the queue URL as `workerQueueUrl`.
+
+```yaml
+# hereyaconfig/hereyavars/hereya-aws-app-lambda.yaml
+workerQueue: "true"
+scheduledWakeTimeoutSec: "300"   # the worker's budget, well past the API's 30 s
+```
+
+**Prefer this to a cron whenever the work is event-shaped** — i.e. whenever
+something *happened* and a job now exists. A cron for that asks a question
+nobody posed: it wakes on the clock, runs thousands of times to find nothing,
+writes a log line each time saying so, and still makes the caller wait up to a
+full period for work that was ready the moment they asked. A queue inverts all
+three — the write **is** the wake.
+
+It also hands you, for free, the three things a cron-driven worker has to build
+by hand and usually builds wrong:
+
+| | cron | queue |
+|---|---|---|
+| **Retry** | your table needs an `attempts` column and a claim protocol | a failed invocation is redelivered |
+| **Recovery** from an invocation killed mid-flight | a lease column, an expiry, and a sweep to notice | the message reappears after `workerQueueVisibilityTimeoutSec` |
+| **Work that never succeeds** | disappears into a log | sits in the dead-letter queue, where `WorkerDlqAlarm` counts it |
+
+- **Entirely opt-in**, same doctrine as the cron: no `workerQueue`, no queue,
+  no DLQ, no event source, no permission.
+- **Both triggers, one handler.** An app may set the cron, the queue, or both.
+  What differs is the event shape — an SQS event carries `Records`, a scheduled
+  event does not — so a handler that serves both branches on that.
+- **`reportBatchItemFailures` is on.** Return `{ batchItemFailures: [...] }`
+  with the ids you could not finish, and only those go back to the queue.
+  Return nothing and a thrown error sends the whole batch back, redoing work
+  that was already done.
+- **`workerQueueVisibilityTimeoutSec` must exceed the function timeout**, or
+  the queue hands the same message to a second worker while the first is still
+  on it. The default (`timeout + 60`) already does.
+- **Concurrency is capped at 2 by default.** Left unbounded, a burst of
+  enqueues can take the account's whole Lambda concurrency and starve the app
+  handler serving actual visitors — a background job taking down the website.
+
+⚠️ **Idempotent here too.** SQS delivers at least once: the same message can
+arrive twice, and a message whose worker was killed *after* the work but
+*before* the delete will certainly arrive again.
+
 ## Alarms — noticing a failure without reading a dashboard
 
 Set `alertTopicArn` and the stack alarms itself into an SNS topic you own. Set
@@ -124,9 +183,10 @@ account, so a cross-stack ARN needs no extra grant.
 | Alarm | Fires when | Sees what nothing else sees |
 |-------|-----------|------------------------------|
 | `HandlerErrors` / `HandlerThrottles` | ≥ 1 in 5 min | The app handler threw, or was throttled |
-| `ScheduledWakeErrors` / `ScheduledWakeThrottles` | ≥ 1 in 5 min | Same, for the cron handler (only with `scheduledWakeCron`) |
+| `ScheduledWakeErrors` / `ScheduledWakeThrottles` | ≥ 1 in 5 min | Same, for the worker handler (only with `scheduledWakeCron` or `workerQueue`) |
 | `HttpApi5xx` | ≥ 1 in 5 min | **A failure the Lambda metric structurally cannot see**: a 502 malformed response, a refused integration, a 504 integration timeout. None of those make the function throw, so `Errors` stays flat at zero while every visitor gets an error page |
 | `ScheduledWakeSilence` | no invocation in `scheduledWakeSilenceHours` | A cron handler that stopped being called *at all* — no error, no log line, no request. Nothing else in the stack mentions it |
+| `WorkerDlq` | ≥ 1 message in the dead-letter queue | **Work that was asked for and never done.** The worker's `Errors` alarm cannot tell that apart: failed invocations are retried, so a job that eventually lands and one that never lands look identical from it. Only with `workerQueue` |
 
 Thresholds are "≥ 1 in 5 minutes" because the expected floor is exactly zero;
 against a zero baseline that is the smallest signal that means something
@@ -222,7 +282,9 @@ announce a recovery only when something actually broke.
 | `dnsRecordCloudfrontApex{Name,Type,Value}` | CNAME (or ALIAS) record at apex → CloudFront |
 | `dnsRecordCloudfrontWww{Name,Type,Value}` | CNAME `www.${domain}` → CloudFront |
 | `dnsRecordsToAdd` | Aggregated JSON array of all records |
-| `scheduledWakeFunctionName` | Lambda invoked on the cron (only when `scheduledWakeCron` is set) |
+| `scheduledWakeFunctionName` | Worker Lambda (only when `scheduledWakeCron` or `workerQueue` is set) |
+| `workerQueueUrl` | SQS queue whose messages invoke the worker (only with `workerQueue`) |
+| `workerDlqUrl` | Dead-letter queue for work that never succeeded (only with `workerQueue`) |
 | `alertTopicArn` | Topic the alarms publish to (only when `alertTopicArn` is set) |
 
 ## Two-deploy ACM flow (external DNS)
