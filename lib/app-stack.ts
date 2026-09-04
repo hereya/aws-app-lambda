@@ -17,6 +17,8 @@ import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as cwActions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import * as events from 'aws-cdk-lib/aws-events';
+import * as sqs from 'aws-cdk-lib/aws-sqs';
+import { SqsEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import { BucketDeployment, Source } from 'aws-cdk-lib/aws-s3-deployment';
 import * as cr from 'aws-cdk-lib/custom-resources';
@@ -157,6 +159,69 @@ export class AppStack extends cdk.Stack {
     const scheduledWakeMemoryMb = process.env['scheduledWakeMemoryMb']
       ? parseInt(process.env['scheduledWakeMemoryMb'])
       : 512;
+
+    // WORK QUEUE — the other trigger for that same handler, and the one to
+    // reach for first. Also entirely OPT-IN: no `workerQueue`, no queue, no
+    // dead-letter queue, no event source, nothing added to the stack.
+    //
+    // WHY A QUEUE RATHER THAN A CRON, when the work is "do this off the
+    // request path". A cron answers a question nobody asked: it wakes on the
+    // clock, so it runs thousands of times to find nothing, it writes a log
+    // line per tick saying so, and it still makes the caller wait up to a
+    // whole period for work that was ready the instant they asked. A queue
+    // inverts all three — the write IS the wake, so the handler runs when
+    // there is something to do and at no other time, and it starts within a
+    // second of the enqueue.
+    //
+    // It also hands over, for free, the three things a cron-driven worker has
+    // to build by hand and usually builds wrong: RETRY (a failed invocation
+    // redelivers), RECOVERY (an invocation killed mid-flight has its message
+    // returned after the visibility timeout, rather than a row wedged in
+    // `running` until some sweep notices), and a DEAD-LETTER QUEUE — a real
+    // place where work that never succeeds lands and can be counted, instead
+    // of disappearing into a log.
+    //
+    // THE HANDLER IS THE SAME ENTRY POINT as the cron's. An app may enable
+    // either, or both; what changes is the event shape (an SQS event carries
+    // `Records`, a scheduled event does not). One function, because it is one
+    // job — "work I could not do inside the request" — and splitting it would
+    // duplicate the bundle, the env, the IAM and the alarms for nothing.
+    const workerQueueEnabled =
+      (process.env['workerQueue'] ?? '').trim().toLowerCase() === 'true';
+    // The visibility timeout is the RECOVERY DELAY: how long the queue waits
+    // for a worker that stopped answering before handing the message to
+    // another one. It MUST exceed the function timeout — otherwise the queue
+    // redelivers a message to a second worker while the first is still
+    // working on it, which is how the same 28 MB gets fetched twice. Default:
+    // the function's own timeout plus a minute of margin for the cold start
+    // and the SDK's own retries.
+    const workerQueueVisibilityTimeoutSec = process.env[
+      'workerQueueVisibilityTimeoutSec'
+    ]
+      ? parseInt(process.env['workerQueueVisibilityTimeoutSec'])
+      : scheduledWakeTimeoutSec + 60;
+    // How many deliveries before a message is set aside in the dead-letter
+    // queue. Default 4 rather than 1: a transient failure (the provider was
+    // slow, a token had just expired) is the common case and costs nothing to
+    // retry, while a message that fails four times is telling you something.
+    const workerQueueMaxReceiveCount = process.env['workerQueueMaxReceiveCount']
+      ? parseInt(process.env['workerQueueMaxReceiveCount'])
+      : 4;
+    // One message per invocation by default. A batch is the right answer for
+    // small, uniform items; this queue exists for the opposite — work that
+    // takes minutes and can be killed by the clock — and a batch of those
+    // fails together.
+    const workerQueueBatchSize = process.env['workerQueueBatchSize']
+      ? parseInt(process.env['workerQueueBatchSize'])
+      : 1;
+    // A ceiling on how many workers the queue may run at once. Left
+    // unbounded, a burst of enqueues can take the whole account's Lambda
+    // concurrency and starve the app handler that serves actual visitors —
+    // the failure mode where a background job takes down the website. 2 is
+    // the minimum AWS accepts.
+    const workerQueueMaxConcurrency = process.env['workerQueueMaxConcurrency']
+      ? parseInt(process.env['workerQueueMaxConcurrency'])
+      : 2;
 
     // Alarms — OPT-IN, and the switch is the SNS topic you hand in.
     //
@@ -389,6 +454,7 @@ export class AppStack extends cdk.Stack {
       { label: 'Handler', fn },
     ];
     let scheduledFn: lambda.Function | undefined;
+    let workerDlq: sqs.Queue | undefined;
 
     // -----------------------------------------------------------------------
     // 4a. Migration Lambda + Custom Resource (deploy-time migrations)
@@ -463,7 +529,7 @@ export class AppStack extends cdk.Stack {
     // customer, and it is the app's job to prevent — see the README.
     // -----------------------------------------------------------------------
 
-    if (scheduledWakeCron) {
+    if (scheduledWakeCron || workerQueueEnabled) {
       scheduledFn = new lambda.Function(this, 'ScheduledWakeHandler', {
         runtime: nodeRuntime,
         handler: scheduledWakeHandler,
@@ -478,6 +544,13 @@ export class AppStack extends cdk.Stack {
       // against a schema the pending migrations have not reached yet.
       if (migrationResource) scheduledFn.node.addDependency(migrationResource);
 
+      new CfnOutput(this, 'scheduledWakeFunctionName', {
+        value: scheduledFn.functionName,
+        description: 'Lambda invoked on the scheduled-wake cron / work queue',
+      });
+    }
+
+    if (scheduledFn && scheduledWakeCron) {
       new events.Rule(this, 'ScheduledWakeRule', {
         // `cron(...)` or `rate(...)` — passed through verbatim. Validating it
         // here would mean re-implementing EventBridge's grammar and going
@@ -495,10 +568,65 @@ export class AppStack extends cdk.Stack {
           }),
         ],
       });
+    }
 
-      new CfnOutput(this, 'scheduledWakeFunctionName', {
-        value: scheduledFn.functionName,
-        description: 'Lambda invoked on the scheduled-wake cron',
+    // -----------------------------------------------------------------------
+    // 4c. Work queue -> the same worker Lambda (see `workerQueue` above)
+    //
+    // The app handler is granted SendMessage and told the URL; the worker is
+    // subscribed to the queue. Writing a message is the whole of "start this
+    // job" from the app's side, and there is nothing to poll on either end.
+    // -----------------------------------------------------------------------
+
+    if (scheduledFn && workerQueueEnabled) {
+      // WHY THE DEAD-LETTER QUEUE IS NOT OPTIONAL when the work queue is on.
+      // Without it, a message that fails its last delivery is DELETED — the
+      // work vanishes, and the only trace is a log line in a handler that had
+      // already failed. With it, the message is still there tomorrow, holding
+      // exactly what was asked for, and `ApproximateNumberOfMessagesVisible`
+      // on it is a number an alarm can watch (see section 10b).
+      workerDlq = new sqs.Queue(this, 'WorkerDlq', {
+        // Long enough that a weekend does not swallow the evidence.
+        retentionPeriod: cdk.Duration.days(14),
+        enforceSSL: true,
+      });
+
+      const workerQueue = new sqs.Queue(this, 'WorkerQueue', {
+        visibilityTimeout: cdk.Duration.seconds(workerQueueVisibilityTimeoutSec),
+        retentionPeriod: cdk.Duration.days(4),
+        enforceSSL: true,
+        deadLetterQueue: {
+          queue: workerDlq,
+          maxReceiveCount: workerQueueMaxReceiveCount,
+        },
+      });
+
+      scheduledFn.addEventSource(
+        new SqsEventSource(workerQueue, {
+          batchSize: workerQueueBatchSize,
+          maxConcurrency: workerQueueMaxConcurrency,
+          // The handler decides, per message, whether the work is retryable:
+          // it reports the ids it could not finish and those alone go back to
+          // the queue. Without this, one message failing in a batch redelivers
+          // every message in that batch — work already done, done again.
+          reportBatchItemFailures: true,
+        }),
+      );
+
+      // Both ends need the URL: the app enqueues, and a worker may split a
+      // job into follow-up messages rather than hold one invocation open.
+      workerQueue.grantSendMessages(fn);
+      workerQueue.grantSendMessages(scheduledFn);
+      fn.addEnvironment('workerQueueUrl', workerQueue.queueUrl);
+      scheduledFn.addEnvironment('workerQueueUrl', workerQueue.queueUrl);
+
+      new CfnOutput(this, 'workerQueueUrl', {
+        value: workerQueue.queueUrl,
+        description: 'SQS queue whose messages invoke the worker Lambda',
+      });
+      new CfnOutput(this, 'workerDlqUrl', {
+        value: workerDlq.queueUrl,
+        description: 'Dead-letter queue for work that never succeeded',
       });
     }
 
@@ -1246,7 +1374,7 @@ exports.handler = async (event) => {
         }),
       );
 
-      if (scheduledFn && scheduledWakeSilenceHours) {
+      if (scheduledFn && scheduledWakeCron && scheduledWakeSilenceHours) {
         alertOn(
           new cloudwatch.Alarm(this, 'ScheduledWakeSilenceAlarm', {
             metric: scheduledFn.metricInvocations({
@@ -1266,6 +1394,39 @@ exports.handler = async (event) => {
               `${scheduledWakeSilenceHours}h (cron ${scheduledWakeCron}). ` +
               `Whatever it does because time passed — reminders, sweeps, ` +
               `renewals — has stopped, silently. Stack ${this.stackName}.`,
+          }),
+        );
+      }
+
+      // Work that never succeeded. Unlike silence, this one needs no window
+      // from the consumer: a message in the dead-letter queue is, by
+      // construction, work that was asked for, tried `maxReceiveCount` times,
+      // and never done. There is no healthy reading above zero.
+      //
+      // It is also the only instrument that sees this failure at all. The
+      // worker's Errors alarm fires on the individual invocations — but those
+      // are RETRIED, so a job that eventually lands is a resolved incident,
+      // and a job that never lands looks identical from that metric. The
+      // difference between the two is exactly what this queue holds.
+      if (workerDlq) {
+        alertOn(
+          new cloudwatch.Alarm(this, 'WorkerDlqAlarm', {
+            metric: workerDlq.metricApproximateNumberOfMessagesVisible({
+              period: cdk.Duration.minutes(5),
+              statistic: 'Maximum',
+            }),
+            threshold: 1,
+            evaluationPeriods: 1,
+            comparisonOperator:
+              cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+            // An empty queue does publish a zero, so absent data here means
+            // the metric itself stopped — not a reason to wake anyone.
+            treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+            alarmDescription:
+              `${domain} — background work landed in the dead-letter queue: ` +
+              `it was requested, retried ${workerQueueMaxReceiveCount} times ` +
+              `and never completed. Whoever asked for it is still waiting. ` +
+              `Stack ${this.stackName}.`,
           }),
         );
       }
