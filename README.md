@@ -45,6 +45,7 @@ Single CDK stack that provisions a fullstack app's runtime + delivery on AWS:
 | `alertTopicArn` | no | — | SNS topic the stack's alarms publish to. **Absent = no alarms at all** |
 | `scheduledWakeSilenceHours` | no | — | Alarm when the **cron** handler has not run once in N hours. **Absent = no silence alarm** |
 | `logAlarms` | no | — | JSON array of log lines that must never appear; each becomes a metric filter + alarm. **Absent = none** (requires `alertTopicArn`) |
+| `viewerCountryPaths` | no | — | Comma-separated CloudFront path patterns that must receive `CloudFront-Viewer-Country`. **Absent = no extra behavior** |
 
 ## Deploy-time migrations — when do they actually run?
 
@@ -163,6 +164,51 @@ by hand and usually builds wrong:
 ⚠️ **Idempotent here too.** SQS delivers at least once: the same message can
 arrive twice, and a message whose worker was killed *after* the work but
 *before* the delete will certainly arrive again.
+
+## Viewer country — the header the all-viewer policy cannot carry
+
+CloudFront knows which country a request came from. It will tell your origin —
+but only if a policy asks for it, and the backend behaviours here cannot ask.
+They forward *all viewer headers except Host*
+(`Managed-AllViewerExceptHostHeader`, the canonical choice for an API Gateway
+origin, which answers a forwarded viewer `Host` with a flat 403), and
+`CloudFront-Viewer-Country` is **not a viewer header** — CloudFront adds it.
+Of CloudFront's five header behaviours only `allViewerAndWhitelistCloudFront`
+adds CloudFront's own headers, and that one forwards `Host` too. There is no
+"all except Host, plus these CloudFront headers".
+
+So the country never arrives, a handler that reads it sees `undefined` for
+ever, and nothing in any log says why. (Measured on dilaya.eu, 2026-09-07:
+every row of the audience table had an empty country.)
+
+The remaining door is an explicit allow list — which must **not** go in front
+of a whole backend surface, because it silently drops every header it does not
+name, `Authorization` included. Hence a narrow, declared surface:
+
+```yaml
+# hereyaconfig/hereyavars/hereya-aws-app-lambda.yaml
+viewerCountryPaths: "/api/m*"
+```
+
+Each pattern gets its own CloudFront behaviour — same Lambda origin, same
+`CACHING_DISABLED` — whose origin-request policy allow-lists
+`CloudFront-Viewer-Country` plus `Accept`, `Accept-Language`, `Content-Type`,
+`Origin`, `Referer` and `User-Agent`, and still forwards **all** cookies and
+query strings (so a visitor cookie the endpoint sets and reads keeps working).
+
+Two things the package enforces, because both failures are silent:
+
+- The declared behaviours are inserted **before** the built-in ones.
+  CloudFront serves the first matching pattern, so `/api/m*` listed after
+  `/api/*` would never be reached — and the country would stay empty with
+  every deploy green.
+- Naming a built-in pattern (`/api/*`, `/mcp`, `/oauth/*`, `/.well-known/*`)
+  is refused at synth. That would put the allow list in front of the
+  authenticated surface and strip the credential from every request: a stack
+  that came up would authenticate nobody.
+
+`Authorization` is deliberately absent from the list. This is for an
+**unauthenticated** browser endpoint — a counter, a beacon.
 
 ## Alarms — noticing a failure without reading a dashboard
 
