@@ -326,6 +326,44 @@ export class AppStack extends cdk.Stack {
     // never appear.
     const logAlarms = parseLogAlarms(process.env['logAlarms']);
 
+    // VIEWER COUNTRY — OPT-IN, and the switch is the list itself.
+    //
+    // WHAT IT SOLVES. CloudFront knows which country a request came from and
+    // will tell the origin — but only if a policy asks for it. The backend
+    // behaviours here forward "all viewer headers except Host"
+    // (ALL_VIEWER_EXCEPT_HOST_HEADER), and `CloudFront-Viewer-Country` is not
+    // a viewer header: CloudFront adds it. So it never arrives, and a handler
+    // that reads it sees `undefined` for ever, with nothing in any log to say
+    // why. Measured on dilaya.eu, 2026-09-07: every row of the audience table
+    // had an empty country column.
+    //
+    // WHY NOT SIMPLY WIDEN THE EXISTING POLICY. CloudFront's header behaviour
+    // is one of five values, and only `allViewerAndWhitelistCloudFront` adds
+    // CloudFront's own headers — that one forwards the VIEWER's Host header
+    // too, which an API Gateway origin answers with a flat 403 (the Host must
+    // be the execute-api domain). There is no "all except Host, plus these
+    // CloudFront headers". The only other door is an explicit allow list, and
+    // an allow list is exactly what must NOT be put in front of the whole
+    // backend surface: it silently drops every header not named, and this
+    // package cannot know which ones an app's routes read.
+    //
+    // HENCE A NARROW, DECLARED SURFACE. The consumer names the path patterns
+    // that need the country — typically one measurement endpoint — and each
+    // gets its own behaviour whose origin-request policy allow-lists the
+    // country header plus the handful a browser endpoint actually needs. The
+    // rest of the backend keeps the all-viewer policy untouched.
+    //
+    //   viewerCountryPaths: "/api/m*"
+    //
+    // The behaviours are inserted BEFORE the built-in ones, because CloudFront
+    // picks the FIRST matching pattern: listed after `/api/*`, `/api/m*` would
+    // never be reached and the country would stay empty with everything
+    // looking green.
+    const viewerCountryPaths = (process.env['viewerCountryPaths'] ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
     // A list with nowhere to publish is the failure this package must never
     // ship: CloudFormation would succeed, the metric filters would exist, and
     // nothing would ever fire. Loud at synth beats silent in production.
@@ -1154,6 +1192,39 @@ exports.handler = async (event) => {
       cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER;
     const apiCachePolicy = cloudfront.CachePolicy.CACHING_DISABLED;
 
+    // The policy behind `viewerCountryPaths` (above). An ALLOW LIST, which is
+    // the whole point and the whole danger: CloudFront forwards these headers
+    // and drops every other one, so this belongs only in front of a route
+    // whose inputs are known. `Authorization` is deliberately absent — this is
+    // for an UNAUTHENTICATED browser endpoint (a counter, a beacon); putting
+    // an authenticated route behind it would strip the credential and turn
+    // every call into an anonymous one. Cookies and query strings are still
+    // forwarded whole, so a session cookie the endpoint sets and reads (a
+    // visitor id, say) keeps working.
+    const viewerCountryOriginRequestPolicy =
+      viewerCountryPaths.length > 0
+        ? new cloudfront.OriginRequestPolicy(
+            this,
+            'ViewerCountryOriginRequestPolicy',
+            {
+              comment:
+                'CloudFront-Viewer-Country + the headers a browser endpoint needs',
+              headerBehavior: cloudfront.OriginRequestHeaderBehavior.allowList(
+                'CloudFront-Viewer-Country',
+                'Accept',
+                'Accept-Language',
+                'Content-Type',
+                'Origin',
+                'Referer',
+                'User-Agent',
+              ),
+              cookieBehavior: cloudfront.OriginRequestCookieBehavior.all(),
+              queryStringBehavior:
+                cloudfront.OriginRequestQueryStringBehavior.all(),
+            },
+          )
+        : undefined;
+
     const distributionProps: cloudfront.DistributionProps = {
       defaultRootObject: 'index.html',
       defaultBehavior: {
@@ -1186,7 +1257,38 @@ exports.handler = async (event) => {
           cachePolicy: apiCachePolicy,
           originRequestPolicy: apiOriginRequestPolicy,
         };
+        // Reserved by this package. A consumer that named one of these in
+        // `viewerCountryPaths` would be asking for the ALLOW-LIST policy in
+        // front of the entire backend surface — including `Authorization` on
+        // /mcp and /oauth/*, which it would drop. Refuse at synth: a stack
+        // that came up would authenticate nobody.
+        const reserved = ['/api/*', '/mcp', '/oauth/*', '/.well-known/*'];
+        const collision = viewerCountryPaths.find((p) => reserved.includes(p));
+        if (collision) {
+          throw new Error(
+            `viewerCountryPaths must name a NARROWER pattern than the ` +
+              `built-in backend behaviours (${reserved.join(', ')}), and ` +
+              `got '${collision}'. That behaviour forwards only an allow ` +
+              `list of headers, so putting it in front of the whole backend ` +
+              `would strip Authorization from every request. Name the ` +
+              `specific path that needs the country, e.g. '/api/m*'.`,
+          );
+        }
+
+        const viewerCountryBehaviors = Object.fromEntries(
+          viewerCountryPaths.map((pattern) => [
+            pattern,
+            {
+              ...apiBehavior,
+              originRequestPolicy: viewerCountryOriginRequestPolicy,
+            } satisfies cloudfront.BehaviorOptions,
+          ]),
+        );
+
         return {
+          // FIRST: CloudFront serves the first matching pattern, and
+          // '/api/*' would otherwise swallow '/api/m*'.
+          ...viewerCountryBehaviors,
           '/api/*': apiBehavior,
           // MCP Streamable-HTTP endpoint. POSTed JSON-RPC. Single
           // pattern, exact match — sub-paths under /mcp/* aren't used
