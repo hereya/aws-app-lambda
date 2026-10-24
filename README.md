@@ -25,7 +25,7 @@ Single CDK stack that provisions a fullstack app's runtime + delivery on AWS:
 | `lambdaHandler` | no | `handler.handler` | Handler export |
 | `lambdaMemoryMb` | no | `512` | Lambda memory |
 | `lambdaTimeoutSec` | no | `30` | Lambda timeout |
-| `nodeRuntime` | no | `nodejs22.x` | Lambda runtime (`nodejs18.x` / `nodejs20.x` / `nodejs22.x`) |
+| `nodeRuntime` | no | `nodejs22.x` | Lambda runtime (`nodejs18.x` / `nodejs20.x` / `nodejs22.x` / `nodejs24.x`) — AWS deprecates `nodejs22.x` on 2027-04-30 |
 | `isSpa` | no | `false` | SPA fallback on static origin |
 | `runMigrations` | no | `true` | Create the migration Lambda + its Custom Resource |
 | `migrationHandler` | no | `migrate.handler` | Migration handler export, inside the same backend bundle |
