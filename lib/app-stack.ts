@@ -2054,6 +2054,7 @@ function resolveNodeRuntime(input: string | undefined): lambda.Runtime {
     'nodejs18.x': lambda.Runtime.NODEJS_18_X,
     'nodejs20.x': lambda.Runtime.NODEJS_20_X,
     'nodejs22.x': lambda.Runtime.NODEJS_22_X,
+    'nodejs24.x': lambda.Runtime.NODEJS_24_X,
   };
   return map[input] ?? lambda.Runtime.NODEJS_22_X;
 }
