@@ -169,3 +169,28 @@ describe('stack with notFoundPage', () => {
     );
   });
 });
+
+describe('stack with redirects', () => {
+  it('inlines the rules in the viewer-request function', () => {
+    const t = synth({
+      hereyaProjectRootDir: makeProject(SITE),
+      notFoundPage: '/404.html',
+      redirects: '/old-page -> /, /en/old-page -> /en',
+    });
+    const codes = functions(t).map((f) => f.Properties.FunctionCode as string);
+    const request = codes.find((c) => c.includes('var REDIRECTS'));
+    assert.ok(request, 'viewer-request carries the rules');
+    assert.match(request!, /var REDIRECTS = \{"\/old-page":"\/","\/en\/old-page":"\/en"\};/);
+  });
+
+  it('refuses a redirect that would hide a page of the build', () => {
+    assert.throws(
+      () =>
+        synth({
+          hereyaProjectRootDir: makeProject(SITE),
+          redirects: '/prix -> /',
+        }),
+      /still a page of the build/,
+    );
+  });
+});

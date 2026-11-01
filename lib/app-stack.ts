@@ -30,9 +30,11 @@ import {
   assertFunctionCodeSize,
   buildCloudFrontFunctionCode,
   buildNotFoundStatusFunctionCode,
+  collectKnownPagePaths,
   NotFoundOptions,
   resolveNotFoundOptions,
 } from './cloudfront-functions';
+import { distExists, parseRedirects } from './redirects';
 
 export class AppStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -131,6 +133,18 @@ export class AppStack extends cdk.Stack {
           distDir: path.join(hereyaProjectRootDir, frontendDistFolder),
         })
       : undefined;
+
+    // Permanent redirects of the static site — OPT-IN (see lib/redirects.ts).
+    // A real 301 at the edge, query string kept; a static build alone can
+    // only emit a meta-refresh page. Refused at synth when a source is still
+    // a page of the build. Absent = the function code is unchanged.
+    const frontendDistDir = path.join(hereyaProjectRootDir, frontendDistFolder);
+    const redirects = parseRedirects(
+      process.env['redirects'],
+      distExists(frontendDistDir)
+        ? collectKnownPagePaths(frontendDistDir)
+        : undefined,
+    );
 
     // Migration support — when truthy (default), create a sibling Lambda that
     // runs database migrations and gate the app Lambda on it via a CFn Custom
@@ -1180,6 +1194,7 @@ exports.handler = async (event) => {
       domain,
       isSpa,
       notFound,
+      redirects,
     });
     assertFunctionCodeSize('viewer-request', cfFunctionCode);
     const urlRewriteFunction = new cloudfront.Function(
