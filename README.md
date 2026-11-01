@@ -9,7 +9,7 @@ Single CDK stack that provisions a fullstack app's runtime + delivery on AWS:
   - `/api/*` → API Gateway origin (`AllowedMethods.ALLOW_ALL`, `CachePolicy.CACHING_DISABLED`, origin-request forwards cookie `hereya_sid` + `Authorization` + `Content-Type`)
   - default `*` → S3 origin (cached, optional SPA fallback to `/index.html` when `isSpa=true`)
 - **ACM certificate** in `us-east-1` for `domain` + `www.${domain}`. Two modes: auto-Route 53 (single deploy, `DnsValidatedCertificate` validated against the workspace's hosted zone) or external DNS (two deploys, `RequestCertificate` + `AddTagsToCertificate` + `DescribeCertificate` custom resources). The cert is tagged with `hereya:stackName=<stack>` after creation so that a tag-filtered synth-time lookup can find THIS stack's cert without colliding with unrelated certs for the same hostname elsewhere in the account. **Non-blocking** in external mode — pass 1 completes on the default `*.cloudfront.net` cert and emits the DNS records the operator must add.
-- **CloudFront Function** on the default behavior: `www → apex 301` + URL rewrite (SPA or MPA). With `notFoundPage`, a second function (viewer-response) on the same behavior sets the not-found page's status to 404.
+- **CloudFront Function** on the default behavior: `www → apex 301`, the optional `redirects` (301), then URL rewrite (SPA or MPA). With `notFoundPage`, a second function (viewer-response) on the same behavior sets the not-found page's status to 404.
 - **Consolidated Secrets Manager secret** — every `secret://`-prefixed env var collected into one JSON secret. Lambda receives `HEREYA_SECRETS_ARN`; the Lambda is expected to read and inject those values on cold start (see template's `secrets.ts`).
 - **IAM auto-attach** — any env var with key matching `iamPolicy*` / `IAM_POLICY_*` is JSON-parsed and its `Statement[]` is attached to the Lambda role.
 
@@ -47,6 +47,7 @@ Single CDK stack that provisions a fullstack app's runtime + delivery on AWS:
 | `logAlarms` | no | — | JSON array of log lines that must never appear; each becomes a metric filter + alarm. **Absent = none** (requires `alertTopicArn`) |
 | `viewerCountryPaths` | no | — | Comma-separated CloudFront path patterns that must receive `CloudFront-Viewer-Country`. **Absent = no extra behavior** |
 | `notFoundPage` | no | — | URI of the site's not-found page in the frontend build (e.g. `/404.html`). Unknown page paths are served that page with status **404** instead of S3's `403 AccessDenied`. Multi-page builds only (refused with `isSpa=true`). **Absent = no change** |
+| `redirects` | no | — | Comma-separated `from -> to` pairs of paths answered with a **301** at the edge, query string kept (e.g. `/old-page -> /, /en/old-page -> /en`). Refused at synth if a source is still a page of the build, the root, a loop or a chain. **Absent = no change** |
 
 ## Deploy-time migrations — when do they actually run?
 
@@ -256,6 +257,26 @@ Limits, all enforced at synth:
 - The page must exist in the build.
 - The list lives in the function code, and CloudFront caps a function at
   10 KB. A build whose list would exceed ~9.5 KB is refused.
+
+### Permanent redirects (`redirects`)
+
+A static build cannot answer with a status code: Astro's `redirects` in
+static mode emits a meta-refresh page served with a 200, which search engines
+treat as a weaker signal than a 301, and which drops the query string. With
+`redirects`, the viewer-request function answers `301 Moved Permanently`
+itself, after the `www` redirect and before the not-found handling:
+
+```yaml
+redirects: "/old-page -> /, /en/old-page -> /en"
+```
+
+- The source is matched like a page path: percent-decoded, trailing `/` and
+  `/index.html` ignored. The `Location` is the target on the same host,
+  with the request's query string appended.
+- `=` is not the separator on purpose: hereya splits a `-p` value on it.
+- Refused at synth: a source that is still a page of the build (the redirect
+  would hide it), the root, a path redirected to itself, the same source
+  twice, and a target that is itself redirected (point at the final target).
 
 Out of scope: unknown **asset** paths (`/missing.css`) still get S3's 403, as
 before. The list is fixed at synth, so a page added to the build is only known

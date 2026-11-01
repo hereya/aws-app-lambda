@@ -1,5 +1,10 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import {
+  buildRedirectBlock,
+  buildRedirectPrelude,
+  RedirectRule,
+} from './redirects';
 
 /**
  * CloudFront Functions caps the code of one function at 10 KB. The guard sits
@@ -128,19 +133,25 @@ function isUnknownPage(uri) {
 
 /**
  * Viewer-request function of the default (static) behaviour.
- * Logic order: 1) www→apex 301, 1b) unknown page → notFoundPage (opt-in),
+ * Logic order: 1) www→apex 301, 1a) permanent redirects (opt-in),
+ * 1b) unknown page → notFoundPage (opt-in),
  * 2) URL rewrite (SPA or MPA).
  */
 export function buildCloudFrontFunctionCode(opts: {
   domain: string;
   isSpa: boolean;
   notFound?: NotFoundOptions;
+  redirects?: RedirectRule[];
 }): string {
   const { domain, isSpa, notFound } = opts;
+  const redirects = opts.redirects ?? [];
   // CloudFront Functions (JS_2_0) — runs at viewer-request. No async, no env.
-  // With `notFound` absent, both insertions are empty strings and the output
-  // is exactly the function this package has always shipped.
-  const prelude = notFound ? buildNotFoundPrelude(notFound) : '';
+  // With `notFound` and `redirects` absent, every insertion is an empty
+  // string and the output is exactly the function this package has always
+  // shipped.
+  const prelude =
+    buildRedirectPrelude(redirects) +
+    (notFound ? buildNotFoundPrelude(notFound) : '');
   const notFoundBlock = notFound
     ? `
   // 1b. Unknown page -> the site's not-found page (status set at viewer-response)
@@ -164,7 +175,7 @@ function handler(event) {
       headers: { location: { value: 'https://${domain}' + uri } }
     };
   }
-${notFoundBlock}
+${buildRedirectBlock(redirects)}${notFoundBlock}
   // 2. URL rewrite (mirrors cloudfront-deploy package)
   var isSpa = ${isSpa ? 'true' : 'false'};
   if (isSpa) {
