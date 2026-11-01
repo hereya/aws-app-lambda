@@ -1,0 +1,47 @@
+
+function handler(event) {
+  var request = event.request;
+  var uri = request.uri;
+  var host = request.headers.host && request.headers.host.value;
+
+  // 1. www -> apex 301
+  if (host === 'www.example.com') {
+    return {
+      statusCode: 301,
+      statusDescription: 'Moved Permanently',
+      headers: { location: { value: 'https://example.com' + uri } }
+    };
+  }
+
+  // 2. URL rewrite (mirrors cloudfront-deploy package)
+  var isSpa = false;
+  if (isSpa) {
+    if (uri === '/') {
+      request.uri = '/index.html';
+      return request;
+    }
+    if (uri.endsWith('/')) {
+      request.uri = uri + 'index.html';
+      return request;
+    }
+    if (!uri.includes('.')) {
+      request.uri = '/index.html';
+      return request;
+    }
+  } else {
+    if (uri === '/') {
+      request.uri = '/index.html';
+      return request;
+    }
+    if (uri.endsWith('/')) {
+      request.uri = uri + 'index.html';
+      return request;
+    }
+    if (!uri.includes('.')) {
+      request.uri = uri + '/index.html';
+      return request;
+    }
+  }
+
+  return request;
+}

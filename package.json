@@ -7,7 +7,7 @@
   "scripts": {
     "build": "tsc",
     "watch": "tsc -w",
-    "test": "echo no tests",
+    "test": "TS_NODE_PREFER_TS_EXTS=true node --require ts-node/register --test test/*.test.ts",
     "cdk": "cdk"
   },
   "devDependencies": {
