@@ -26,6 +26,13 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import { Construct } from 'constructs';
 import * as path from 'path';
+import {
+  assertFunctionCodeSize,
+  buildCloudFrontFunctionCode,
+  buildNotFoundStatusFunctionCode,
+  NotFoundOptions,
+  resolveNotFoundOptions,
+} from './cloudfront-functions';
 
 export class AppStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -108,6 +115,22 @@ export class AppStack extends cdk.Stack {
       : 30;
     const nodeRuntime = resolveNodeRuntime(process.env['nodeRuntime']);
     const isSpa = process.env['isSpa'] === 'true';
+
+    // Not-found page for a multi-page static build — OPT-IN. Unknown PAGE
+    // paths are served the site's own page with status 404 instead of S3's
+    // 403 AccessDenied XML. Done with CloudFront Functions on the DEFAULT
+    // behaviour only, never with `errorResponses`: those are
+    // distribution-wide and would also rewrite the 4xx the backend behaviours
+    // (/api/*, /mcp, /oauth/*, /.well-known/*) return on purpose. Absent = the
+    // template is byte-for-byte what it was before.
+    const notFoundPage = process.env['notFoundPage']?.trim() || undefined;
+    const notFound: NotFoundOptions | undefined = notFoundPage
+      ? resolveNotFoundOptions({
+          notFoundPage,
+          isSpa,
+          distDir: path.join(hereyaProjectRootDir, frontendDistFolder),
+        })
+      : undefined;
 
     // Migration support — when truthy (default), create a sibling Lambda that
     // runs database migrations and gate the app Lambda on it via a CFn Custom
@@ -1153,7 +1176,12 @@ exports.handler = async (event) => {
     // 9. CloudFront Function — www→apex 301 + URL rewrite (templated at synth)
     // -----------------------------------------------------------------------
 
-    const cfFunctionCode = buildCloudFrontFunctionCode({ domain, isSpa });
+    const cfFunctionCode = buildCloudFrontFunctionCode({
+      domain,
+      isSpa,
+      notFound,
+    });
+    assertFunctionCodeSize('viewer-request', cfFunctionCode);
     const urlRewriteFunction = new cloudfront.Function(
       this,
       'UrlRewriteFunction',
@@ -1162,6 +1190,23 @@ exports.handler = async (event) => {
         code: cloudfront.FunctionCode.fromInline(cfFunctionCode),
       },
     );
+
+    // Viewer-response half of `notFoundPage`: sets 404 on the page the
+    // viewer-request function served for an unknown path. Attached to the
+    // default behaviour ONLY, so backend responses are never touched.
+    let notFoundStatusFunction: cloudfront.Function | undefined;
+    if (notFound) {
+      const notFoundStatusCode = buildNotFoundStatusFunctionCode(notFound);
+      assertFunctionCodeSize('viewer-response', notFoundStatusCode);
+      notFoundStatusFunction = new cloudfront.Function(
+        this,
+        'NotFoundStatusFunction',
+        {
+          runtime: cloudfront.FunctionRuntime.JS_2_0,
+          code: cloudfront.FunctionCode.fromInline(notFoundStatusCode),
+        },
+      );
+    }
 
     // /api/* origin: strip "https://" off the APIGW endpoint to get the host
     const apiOriginDomain = cdk.Fn.select(
@@ -1237,6 +1282,14 @@ exports.handler = async (event) => {
             function: urlRewriteFunction,
             eventType: cloudfront.FunctionEventType.VIEWER_REQUEST,
           },
+          ...(notFoundStatusFunction
+            ? [
+                {
+                  function: notFoundStatusFunction,
+                  eventType: cloudfront.FunctionEventType.VIEWER_RESPONSE,
+                },
+              ]
+            : []),
         ],
       },
       additionalBehaviors: (() => {
@@ -2057,61 +2110,4 @@ function resolveNodeRuntime(input: string | undefined): lambda.Runtime {
     'nodejs24.x': lambda.Runtime.NODEJS_24_X,
   };
   return map[input] ?? lambda.Runtime.NODEJS_22_X;
-}
-
-function buildCloudFrontFunctionCode(opts: {
-  domain: string;
-  isSpa: boolean;
-}): string {
-  const { domain, isSpa } = opts;
-  // CloudFront Functions (JS_2_0) — runs at viewer-request. No async, no env.
-  // Logic order: 1) www→apex 301, 2) URL rewrite (SPA or MPA).
-  return `
-function handler(event) {
-  var request = event.request;
-  var uri = request.uri;
-  var host = request.headers.host && request.headers.host.value;
-
-  // 1. www -> apex 301
-  if (host === 'www.${domain}') {
-    return {
-      statusCode: 301,
-      statusDescription: 'Moved Permanently',
-      headers: { location: { value: 'https://${domain}' + uri } }
-    };
-  }
-
-  // 2. URL rewrite (mirrors cloudfront-deploy package)
-  var isSpa = ${isSpa ? 'true' : 'false'};
-  if (isSpa) {
-    if (uri === '/') {
-      request.uri = '/index.html';
-      return request;
-    }
-    if (uri.endsWith('/')) {
-      request.uri = uri + 'index.html';
-      return request;
-    }
-    if (!uri.includes('.')) {
-      request.uri = '/index.html';
-      return request;
-    }
-  } else {
-    if (uri === '/') {
-      request.uri = '/index.html';
-      return request;
-    }
-    if (uri.endsWith('/')) {
-      request.uri = uri + 'index.html';
-      return request;
-    }
-    if (!uri.includes('.')) {
-      request.uri = uri + '/index.html';
-      return request;
-    }
-  }
-
-  return request;
-}
-`;
 }
