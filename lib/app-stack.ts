@@ -35,6 +35,11 @@ import {
   resolveNotFoundOptions,
 } from './cloudfront-functions';
 import { distExists, parseRedirects } from './redirects';
+import {
+  collectIndexDirectories,
+  resolveSpaEdgeRewrite,
+  SpaEdgeOptions,
+} from './spa';
 
 export class AppStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -117,6 +122,15 @@ export class AppStack extends cdk.Stack {
       : 30;
     const nodeRuntime = resolveNodeRuntime(process.env['nodeRuntime']);
     const isSpa = process.env['isSpa'] === 'true';
+    // SPA fallback at the edge — OPT-IN (see lib/spa.ts). Replaces the
+    // distribution-wide 403/404 -> /index.html error responses, which also
+    // turn the backend behaviours' 4xx into the app's HTML with a 200, by a
+    // rewrite in the viewer-request function of the DEFAULT behaviour only.
+    // Absent = the template is byte-for-byte what it was before.
+    const spaEdgeRewrite = resolveSpaEdgeRewrite(
+      process.env['spaEdgeRewrite'],
+      isSpa,
+    );
 
     // Not-found page for a multi-page static build — OPT-IN. Unknown PAGE
     // paths are served the site's own page with status 404 instead of S3's
@@ -1190,11 +1204,29 @@ exports.handler = async (event) => {
     // 9. CloudFront Function — www→apex 301 + URL rewrite (templated at synth)
     // -----------------------------------------------------------------------
 
+    // The backend behaviour patterns, in one list: the SPA edge fallback
+    // leaves them untouched even if one ever reached the static function.
+    const backendPathPatterns = [
+      ...viewerCountryPaths,
+      '/api/*',
+      '/mcp',
+      '/oauth/*',
+      '/.well-known/*',
+    ];
+    const spaEdge: SpaEdgeOptions | undefined = spaEdgeRewrite
+      ? {
+          indexDirs: distExists(frontendDistDir)
+            ? collectIndexDirectories(frontendDistDir)
+            : [],
+          backendPatterns: backendPathPatterns,
+        }
+      : undefined;
     const cfFunctionCode = buildCloudFrontFunctionCode({
       domain,
       isSpa,
       notFound,
       redirects,
+      spaEdge,
     });
     assertFunctionCodeSize('viewer-request', cfFunctionCode);
     const urlRewriteFunction = new cloudfront.Function(
@@ -1374,7 +1406,9 @@ exports.handler = async (event) => {
           '/.well-known/*': apiBehavior,
         };
       })(),
-      errorResponses: isSpa
+      // Legacy SPA fallback. Distribution-wide by CloudFront's design, so it
+      // also rewrites the backend's 403/404 — `spaEdgeRewrite=true` drops it.
+      errorResponses: isSpa && !spaEdgeRewrite
         ? [
             {
               httpStatus: 404,

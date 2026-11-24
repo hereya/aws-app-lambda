@@ -7,7 +7,7 @@ Single CDK stack that provisions a fullstack app's runtime + delivery on AWS:
 - **S3 bucket** for built static frontend assets
 - **CloudFront distribution** with two behaviors:
   - `/api/*` → API Gateway origin (`AllowedMethods.ALLOW_ALL`, `CachePolicy.CACHING_DISABLED`, origin-request forwards cookie `hereya_sid` + `Authorization` + `Content-Type`)
-  - default `*` → S3 origin (cached, optional SPA fallback to `/index.html` when `isSpa=true`)
+  - default `*` → S3 origin (cached, optional SPA fallback to `/index.html` when `isSpa=true`; with `spaEdgeRewrite=true` that fallback is done at the edge on this behavior only)
 - **ACM certificate** in `us-east-1` for `domain` + `www.${domain}`. Two modes: auto-Route 53 (single deploy, `DnsValidatedCertificate` validated against the workspace's hosted zone) or external DNS (two deploys, `RequestCertificate` + `AddTagsToCertificate` + `DescribeCertificate` custom resources). The cert is tagged with `hereya:stackName=<stack>` after creation so that a tag-filtered synth-time lookup can find THIS stack's cert without colliding with unrelated certs for the same hostname elsewhere in the account. **Non-blocking** in external mode — pass 1 completes on the default `*.cloudfront.net` cert and emits the DNS records the operator must add.
 - **CloudFront Function** on the default behavior: `www → apex 301`, the optional `redirects` (301), then URL rewrite (SPA or MPA). With `notFoundPage`, a second function (viewer-response) on the same behavior sets the not-found page's status to 404.
 - **Consolidated Secrets Manager secret** — every `secret://`-prefixed env var collected into one JSON secret. Lambda receives `HEREYA_SECRETS_ARN`; the Lambda is expected to read and inject those values on cold start (see template's `secrets.ts`).
@@ -27,6 +27,7 @@ Single CDK stack that provisions a fullstack app's runtime + delivery on AWS:
 | `lambdaTimeoutSec` | no | `30` | Lambda timeout |
 | `nodeRuntime` | no | `nodejs22.x` | Lambda runtime (`nodejs18.x` / `nodejs20.x` / `nodejs22.x` / `nodejs24.x`) — AWS deprecates `nodejs22.x` on 2027-04-30 |
 | `isSpa` | no | `false` | SPA fallback on static origin |
+| `spaEdgeRewrite` | no | — | With `isSpa=true`: `true` does the SPA fallback in the viewer-request function of the static behavior and removes the distribution-wide 403/404 error responses, so backend 4xx keep their status and body. See [SPA fallback at the edge](#spa-fallback-at-the-edge-spaedgerewrite). **Absent = legacy error responses** |
 | `runMigrations` | no | `true` | Create the migration Lambda + its Custom Resource |
 | `migrationHandler` | no | `migrate.handler` | Migration handler export, inside the same backend bundle |
 | `migrationHashFolder` | no | `drizzle` | Folder (inside the bundle) whose files decide when migrations re-run |
@@ -257,6 +258,47 @@ Limits, all enforced at synth:
 - The page must exist in the build.
 - The list lives in the function code, and CloudFront caps a function at
   10 KB. A build whose list would exceed ~9.5 KB is refused.
+
+### SPA fallback at the edge (`spaEdgeRewrite`)
+
+With `isSpa=true` alone, the SPA fallback is a pair of CloudFront custom
+error responses: a `403` or `404` becomes `/index.html` with a `200`. They
+apply to the **whole distribution** (see above), so a `403`
+or a `404` returned by `/api/*`, `/mcp`, `/oauth/*` or `/.well-known/*`
+reaches the client as the app's HTML with a `200`. An OAuth or MCP client,
+or a `fetch`, then gets a web page where it expects its JSON error.
+
+```yaml
+isSpa: "true"
+spaEdgeRewrite: "true"
+```
+
+removes the error responses and lets the viewer-request function of the
+**default (static) behavior** do the fallback. The backend behaviors never run
+it, so their responses pass through untouched. After the `www` redirect and
+`redirects`:
+
+| Request | Served |
+|---|---|
+| `/`, or a path whose last segment has no dot (`/dashboard`, `/users/42`) | `/index.html` (200) |
+| a trailing-slash path whose directory has its own `index.html` in the build (`/docs/`) | that `index.html` |
+| any other trailing-slash path (`/settings/`) | `/index.html` (200) |
+| a path whose last segment has a dot (`/assets/app.js`, `/favicon.ico`) | the file, or S3's `403` if it does not exist |
+| a backend path, if one ever reached the function | untouched |
+
+The query string is kept on every rewrite.
+
+**What changes against the legacy fallback**, and why it is opt-in: a path
+whose last segment contains a dot and that is not a file of the build — a
+missing asset, or a client route such as `/u/jane.doe` — used to get the app
+shell with a `200`; it now gets S3's `403`. For a stale hashed chunk this is
+the better answer (the loader sees an error, not HTML parsed as JavaScript);
+a client route with a dot in its last segment must be renamed before turning
+this on. Every other static path is served the same as before.
+
+Limits: refused without `isSpa=true`; the list of directories holding an
+`index.html` is inlined into the function code, under the same ~9.5 KB guard
+as `notFoundPage`.
 
 ### Permanent redirects (`redirects`)
 

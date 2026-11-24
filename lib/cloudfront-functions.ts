@@ -5,6 +5,7 @@ import {
   buildRedirectPrelude,
   RedirectRule,
 } from './redirects';
+import { buildSpaEdgeBlock, buildSpaEdgePrelude, SpaEdgeOptions } from './spa';
 
 /**
  * CloudFront Functions caps the code of one function at 10 KB. The guard sits
@@ -131,51 +132,9 @@ function isUnknownPage(uri) {
 `;
 }
 
-/**
- * Viewer-request function of the default (static) behaviour.
- * Logic order: 1) www→apex 301, 1a) permanent redirects (opt-in),
- * 1b) unknown page → notFoundPage (opt-in),
- * 2) URL rewrite (SPA or MPA).
- */
-export function buildCloudFrontFunctionCode(opts: {
-  domain: string;
-  isSpa: boolean;
-  notFound?: NotFoundOptions;
-  redirects?: RedirectRule[];
-}): string {
-  const { domain, isSpa, notFound } = opts;
-  const redirects = opts.redirects ?? [];
-  // CloudFront Functions (JS_2_0) — runs at viewer-request. No async, no env.
-  // With `notFound` and `redirects` absent, every insertion is an empty
-  // string and the output is exactly the function this package has always
-  // shipped.
-  const prelude =
-    buildRedirectPrelude(redirects) +
-    (notFound ? buildNotFoundPrelude(notFound) : '');
-  const notFoundBlock = notFound
-    ? `
-  // 1b. Unknown page -> the site's not-found page (status set at viewer-response)
-  if (isUnknownPage(uri)) {
-    request.uri = NOT_FOUND_URI;
-    return request;
-  }
-`
-    : '';
-  return `${prelude}
-function handler(event) {
-  var request = event.request;
-  var uri = request.uri;
-  var host = request.headers.host && request.headers.host.value;
-
-  // 1. www -> apex 301
-  if (host === 'www.${domain}') {
-    return {
-      statusCode: 301,
-      statusDescription: 'Moved Permanently',
-      headers: { location: { value: 'https://${domain}' + uri } }
-    };
-  }
-${buildRedirectBlock(redirects)}${notFoundBlock}
+/** Section 2 of the viewer-request function, as shipped since the start. */
+function legacyRewrite(isSpa: boolean): string {
+  return `
   // 2. URL rewrite (mirrors cloudfront-deploy package)
   var isSpa = ${isSpa ? 'true' : 'false'};
   if (isSpa) {
@@ -212,6 +171,56 @@ ${buildRedirectBlock(redirects)}${notFoundBlock}
 }
 
 /**
+ * Viewer-request function of the default (static) behaviour.
+ * Logic order: 1) www→apex 301, 1a) permanent redirects (opt-in),
+ * 1b) unknown page → notFoundPage (opt-in),
+ * 2) URL rewrite (SPA or MPA), or with `spaEdge` the SPA fallback that
+ *    replaces the distribution-wide error responses (see lib/spa.ts).
+ */
+export function buildCloudFrontFunctionCode(opts: {
+  domain: string;
+  isSpa: boolean;
+  notFound?: NotFoundOptions;
+  redirects?: RedirectRule[];
+  spaEdge?: SpaEdgeOptions;
+}): string {
+  const { domain, isSpa, notFound, spaEdge } = opts;
+  const redirects = opts.redirects ?? [];
+  // CloudFront Functions (JS_2_0) — runs at viewer-request. No async, no env.
+  // With `notFound` and `redirects` absent, every insertion is an empty
+  // string and the output is exactly the function this package has always
+  // shipped.
+  const prelude =
+    buildRedirectPrelude(redirects) +
+    (notFound ? buildNotFoundPrelude(notFound) : '') +
+    (spaEdge ? buildSpaEdgePrelude(spaEdge) : '');
+  const notFoundBlock = notFound
+    ? `
+  // 1b. Unknown page -> the site's not-found page (status set at viewer-response)
+  if (isUnknownPage(uri)) {
+    request.uri = NOT_FOUND_URI;
+    return request;
+  }
+`
+    : '';
+  return `${prelude}
+function handler(event) {
+  var request = event.request;
+  var uri = request.uri;
+  var host = request.headers.host && request.headers.host.value;
+
+  // 1. www -> apex 301
+  if (host === 'www.${domain}') {
+    return {
+      statusCode: 301,
+      statusDescription: 'Moved Permanently',
+      headers: { location: { value: 'https://${domain}' + uri } }
+    };
+  }
+${buildRedirectBlock(redirects)}${notFoundBlock}${spaEdge ? buildSpaEdgeBlock() : legacyRewrite(isSpa)}`;
+}
+
+/**
  * Viewer-response function of the default (static) behaviour, only created
  * with `notFoundPage`. It turns the 200 S3 returned for the not-found page
  * into a 404.
@@ -245,9 +254,10 @@ export function assertFunctionCodeSize(name: string, code: string): void {
     throw new Error(
       `The generated ${name} CloudFront Function is ${bytes} bytes, above ` +
         `the ${MAX_FUNCTION_CODE_BYTES}-byte guard (CloudFront caps a ` +
-        `function at 10 KB). With notFoundPage the list of known page paths ` +
-        `is inlined into the code, and this build has too many pages for it. ` +
-        `Remove notFoundPage for this site.`,
+        `function at 10 KB). With notFoundPage (page paths) or spaEdgeRewrite ` +
+        `(directories holding an index.html) a list from the build is ` +
+        `inlined into the code, and this build has too many entries for it. ` +
+        `Remove that option for this site.`,
     );
   }
 }

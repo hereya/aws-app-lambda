@@ -170,6 +170,44 @@ describe('stack with notFoundPage', () => {
   });
 });
 
+describe('stack with isSpa', () => {
+  const SPA_SITE = ['index.html', 'docs/index.html', 'assets/app.js'];
+
+  it('without spaEdgeRewrite keeps the legacy error responses', () => {
+    const t = synth({ hereyaProjectRootDir: makeProject(SPA_SITE), isSpa: 'true' });
+    const codes = distributionConfig(t).CustomErrorResponses.map((r: any) => r.ErrorCode);
+    assert.deepEqual(codes, [404, 403]);
+  });
+
+  it('with spaEdgeRewrite: no error responses, function on the default behaviour only', () => {
+    const t = synth({
+      hereyaProjectRootDir: makeProject(SPA_SITE),
+      isSpa: 'true',
+      spaEdgeRewrite: 'true',
+      viewerCountryPaths: '/api/m*',
+    });
+    const config = distributionConfig(t);
+    assert.equal(config.CustomErrorResponses, undefined);
+    assert.deepEqual(eventTypes(config.DefaultCacheBehavior), ['viewer-request']);
+    assert.ok(config.CacheBehaviors.length >= 5);
+    for (const b of config.CacheBehaviors) {
+      assert.deepEqual(eventTypes(b), [], `behaviour ${b.PathPattern}`);
+    }
+    const fns = functions(t);
+    assert.equal(fns.length, 1);
+    const code = fns[0].Properties.FunctionCode as string;
+    assert.match(code, /var SPA_INDEX_DIRS = \{"\/docs":1\};/);
+    assert.match(code, /"\^\/api\/m\.\*\$"/);
+  });
+
+  it('refuses spaEdgeRewrite without isSpa', () => {
+    assert.throws(
+      () => synth({ hereyaProjectRootDir: makeProject(SITE), spaEdgeRewrite: 'true' }),
+      /requires isSpa=true/,
+    );
+  });
+});
+
 describe('stack with redirects', () => {
   it('inlines the rules in the viewer-request function', () => {
     const t = synth({
